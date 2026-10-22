@@ -10,6 +10,25 @@
 #include <io.h>
 #define LIMIT (4u*1024u*1024u)
 static HWND owner;
+/* All HWNDs belong to this Wine server/prefix. Never close a window or stop its
+   owner: only hide Wine explorer's legacy tray host, keeping UU's tray alive. */
+static BOOL CALLBACK hide_tray(HWND window, LPARAM context) {
+    WCHAR cls[64], image[1024]; DWORD pid=0, size=1024;
+    (void)context;
+    if(!GetClassNameW(window,cls,64) || wcscmp(cls,L"Shell_TrayWnd"))return TRUE;
+    GetWindowThreadProcessId(window,&pid);
+    HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
+    if(!process)return TRUE;
+    BOOL found=QueryFullProcessImageNameW(process,0,image,&size);
+    CloseHandle(process);
+    const WCHAR *base=found?wcsrchr(image,L'\\'):0;
+    if(base && !_wcsicmp(base+1,L"explorer.exe") && IsWindowVisible(window))ShowWindowAsync(window,SW_HIDE);
+    return TRUE;
+}
+static VOID CALLBACK hide_tray_timer(HWND window,UINT message,UINT_PTR id,DWORD tick) {
+    (void)window;(void)message;(void)id;(void)tick;
+    EnumWindows(hide_tray,0);
+}
 static int exact(void *p,size_t n) {return fread(p,1,n,stdin)==n;}
 static void get(DWORD previous) {
     DWORD seq=GetClipboardSequenceNumber();
@@ -56,10 +75,13 @@ static DWORD WINAPI commands(void *unused) {
     }
     return 0;
 }
-int main(void) {
+int main(int argc,char **argv) {
+    if(argc==2 && !strcmp(argv[1],"--hide-tray-once")){EnumWindows(hide_tray,0);return 0;}
+    if(argc!=1)return 2;
     _setmode(_fileno(stdin),_O_BINARY);_setmode(_fileno(stdout),_O_BINARY);
     owner=CreateWindowExW(0,L"STATIC",L"UU text clipboard transport",0,0,0,0,0,HWND_MESSAGE,0,GetModuleHandleW(0),0);
     if(!owner)return 1;
+    if(!getenv("UUWAY_SHOW_WINE_TRAY")){EnumWindows(hide_tray,0);SetTimer(owner,1,1000,hide_tray_timer);}
     HANDLE reader=CreateThread(0,0,commands,0,0,0);
     if(!reader)return 1;
     /* Wine's clipboard/X11 driver must dispatch messages even while stdin is

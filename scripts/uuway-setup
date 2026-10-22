@@ -11,4 +11,7 @@ if [[ ! -f "$prefix/drive_c/Program Files/Netease/GameViewer/bin/GameViewerServe
     [[ -f "$chosen" ]] || exit 1
     installer=(--installer "$chosen")
 fi
-exec /usr/bin/uuway setup --yes --only wine,udev,prefix,helpers,fcitx,portal,runtime,start,consent,launchers "${installer[@]}"
+/usr/bin/uuway setup --yes --only wine,udev,prefix,helpers,fcitx,portal,runtime,start,consent,launchers "${installer[@]}"
+echo '默认配置：greetd 自动登录后立即密码锁屏，UU 在锁屏后台运行；GNOME Keyring 由锁屏 PAM 解锁。'
+echo '配置从下次登录生效。不会保存密码，也不会重启当前桌面。'
+exec /usr/bin/python3 /usr/lib/uuway/scripts/uuway_desktop.py install "$@"

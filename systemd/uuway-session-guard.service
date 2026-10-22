@@ -1,0 +1,16 @@
+[Unit]
+Description=UUWay login lock guard
+PartOf=graphical-session.target
+Wants=noctalia.service
+After=graphical-session.target noctalia.service
+Before=uu-native-bridge.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/lib/uuway/scripts/uuway_desktop.py guard
+RemainAfterExit=yes
+TimeoutStartSec=40
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

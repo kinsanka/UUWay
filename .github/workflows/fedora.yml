@@ -1,9 +1,9 @@
 name: Fedora Umbriel checks
 on:
   push:
-    branches: [fedora-umbriel]
+    branches: [main]
   pull_request:
-    branches: [fedora-umbriel]
+    branches: [main]
 permissions:
   contents: read
 jobs:
@@ -16,6 +16,6 @@ jobs:
       - name: Hardware-independent acceptance tests
         run: |
           set -e
-          for suite in test_unified_supervisor test_native_service test_fedora_port test_native_runtime_package test_uuway_cli test_wayland_portal_probe; do
+          for suite in test_desktop_defaults test_unified_supervisor test_native_service test_fedora_port test_native_runtime_package test_uuway_cli test_wayland_portal_probe; do
             python3 -m unittest discover -s tests -p "$suite.py"
           done

@@ -28,6 +28,10 @@ def entries():
         ('scripts/uuway-setup', f'{manifest.LIB}/scripts/uuway-setup', 0o755),
         ('packaging/uuway-setup.desktop', 'usr/share/applications/uuway-setup.desktop', 0o644),
         ('docs/fedora.md', 'usr/share/doc/uuway/fedora.md', 0o644),
+        ('docs/desktop-defaults.md', 'usr/share/doc/uuway/desktop-defaults.md', 0o644),
+        ('scripts/uuway_desktop.py', f'{manifest.LIB}/scripts/uuway_desktop.py', 0o755),
+        ('scripts/uuway_desktop_system.py', f'{manifest.LIB}/scripts/uuway_desktop_system.py', 0o755),
+        ('systemd/uuway-session-guard.service', f'{manifest.LIB}/systemd/uuway-session-guard.service', 0o644),
     ])
     return result
 
@@ -72,6 +76,8 @@ Requires: python3 python3-gobject python3-dbus gtk3 at-spi2-core
 Requires: xorg-x11-server-Xvfb xclip wl-clipboard procps-ng systemd udev xdg-desktop-portal zenity
 Requires: wine-core >= 11.0
 Requires: wine-core < 11.1
+Requires: gnome-keyring gnome-keyring-pam seahorse libsecret
+Requires: noctalia >= 5.3.0
 Recommends: fcitx5 intel-media-driver
 %global debug_package %{{nil}}
 %global __brp_strip %{{nil}}

@@ -8,8 +8,8 @@ desktop=${XDG_CURRENT_DESKTOP:-}
 [[ ${XDG_SESSION_TYPE:-} == wayland && ${desktop,,} == *umbriel* ]] || {
     echo '请在 Umbriel 桌面的终端里运行安装程序。' >&2; exit 1;
 }
-tag=fedora-0.18.0
-rpm_name=uuway-0.18.0-1.fedora_umbriel.fc44.x86_64.rpm
+tag=fedora-0.18.1
+rpm_name=uuway-0.18.1-1.fedora_umbriel.fc44.x86_64.rpm
 base="https://github.com/kinsanka/UUWay/releases/download/$tag"
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/uuway-installer/$tag"
 mkdir -p "$cache"

@@ -1,6 +1,6 @@
 # Fedora 44 / Umbriel 发布说明
 
-本分支面向已有 Umbriel 桌面的 Fedora 用户，不安装或替换合成器、Noctalia、音频服务器或其他远程软件。普通安装见 [README](../README.md)。旧的 [niri 调试记录](fedora-niri-intel.md) 是迁移历史，不代表当前安装方式。
+本项目面向已有 Umbriel + Noctalia 桌面的 Fedora 用户，不替换合成器、音频服务器或其他远程软件。0.18.1 的默认登录、锁屏与 GNOME Keyring 集成见 [桌面默认配置](desktop-defaults.md)。普通安装见 [README](../README.md)。旧的 [niri 调试记录](fedora-niri-intel.md) 是迁移历史，不代表当前安装方式。
 
 ## 目标与架构
 
@@ -35,7 +35,7 @@ sudo dnf install --setopt=install_weak_deps=False wine wine-devel gcc gcc-c++ \
   gstreamer1-plugins-base-devel xorg-x11-server-Xvfb xclip wl-clipboard \
   python3-gobject python3-dbus gtk3 at-spi2-core git ripgrep rpm-build zenity
 bash scripts/build-fedora.sh
-python3 packaging/build-rpm.py --version 0.18.0 --release 1.fedora_umbriel
+python3 packaging/build-rpm.py --version 0.18.1 --release 1.fedora_umbriel
 ```
 
 构建脚本固定 DXVK v3.1（70d7508c01201ed3d4bfb33da42ba834eafe3857）和 nv-codec-headers n13.0.19.0（e844e5b26f46bb77479f063029595293aa8f812d），核对源码版本。DXVK 修改以 `patches/dxvk-3.1-private-capture.patch` 提供。Fedora 使用系统 MinGW、Wine 开发头和 glslang，不抽取 Ubuntu 开发包。FFmpeg 等动态库由 RPM 解析为系统依赖。
@@ -48,7 +48,7 @@ python3 packaging/build-rpm.py --version 0.18.0 --release 1.fedora_umbriel
 
 ```sh
 set -e
-for suite in test_unified_supervisor test_native_service test_fedora_port \
+for suite in test_desktop_defaults test_unified_supervisor test_native_service test_fedora_port \
   test_native_runtime_package test_uuway_cli test_wayland_portal_probe; do
   python3 -m unittest discover -s tests -p "$suite.py"
 done
