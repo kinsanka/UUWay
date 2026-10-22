@@ -48,26 +48,35 @@ def existing_display_policy(content):
     return '--preserve-display-session' in command[4:]
 
 
-def install(bundle, prefix, restore_state, state_parent, text_socket, cursor_mode=None, preserve_display_session=None):
+def install(bundle, prefix, restore_state, state_parent, text_socket, cursor_mode=None,
+            preserve_display_session=None, backend=None):
     verified = trial.bundle_tools.verify(bundle)
     if not verified.get('native_service_lifetime_included'):
         raise ValueError('Expected a continuous-lifetime capable native bundle')
     for directory in (prefix, restore_state.parent, state_parent, text_socket.parent):
         trial.private_directory(directory)
     # Fixed schema prevents shell/environment injection; never store credentials.
+    selected_backend = backend or verified.get('backend', 'nvidia')
+    if selected_backend not in ('nvidia', 'amd'):
+        raise ValueError('Unknown GPU backend')
     config = dict(schema=1, prefix=str(prefix.resolve()), bundle=str(bundle.resolve()),
                   restore_state=str(restore_state.absolute()), state_parent=str(state_parent.resolve()),
-                  text_socket=str(text_socket.absolute()), cursor_mode=cursor_mode)
+                  text_socket=str(text_socket.absolute()), cursor_mode=cursor_mode,
+                  backend=selected_backend)
     config_dir = Path.home() / '.config/uurb'
     config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     trial.private_directory(config_dir)
     config_path = config_dir / 'native-runtime.json'
     if config_path.exists() or config_path.is_symlink():
         previous = trial.state_tools.read_private(config_path)
-        if set(previous) != set(config) or previous.get('schema') != 1:
+        allowed_old = set(config) - {'backend'}
+        if (set(previous) not in (allowed_old, set(config)) or previous.get('schema') != 1):
             raise ValueError('Refusing an unrecognized service configuration')
         if cursor_mode is None:
             cursor_mode = previous.get('cursor_mode')
+        if backend is None and previous.get('backend') in ('nvidia', 'amd'):
+            selected_backend = previous['backend']
+            config['backend'] = selected_backend
     elif cursor_mode is None:
         cursor_mode = 'metadata'
     if (cursor_mode not in ('embedded', 'metadata', 'composited') or
@@ -81,6 +90,9 @@ def install(bundle, prefix, restore_state, state_parent, text_socket, cursor_mod
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
         raise ValueError('Unsafe user unit directory')
     units = [unit_dir / ('uu-native-' + name + '.service') for name in ('text', 'display', 'bridge')]
+    unified = 'umbriel' in os.environ.get('XDG_CURRENT_DESKTOP', '').lower().split(':')
+    if unified:
+        units = [unit_dir / 'uu-native-bridge.service']
     old_display_policy = False
     for unit in units:
         if unit.exists() or unit.is_symlink():
@@ -106,6 +118,21 @@ def install(bundle, prefix, restore_state, state_parent, text_socket, cursor_mod
     for unit in units:
         content = (ROOT / 'systemd' / (unit.name + '.in')).read_text().replace('@ROOT@', roots[unit].replace('%', '%%'))
         content = content.replace('@DISPLAY_POLICY@', ' --preserve-display-session' if preserve_display_session else '')
+        if unified:
+            for peer in ('text', 'display'):
+                content = content.replace('Wants=uu-native-' + peer + '.service\n', '')
+                content = content.replace('After=uu-native-' + peer + '.service\n', '')
+            content = content.replace('Description=UU native Wayland GPU bridge',
+                                      'Description=UUWay unified Umbriel background')
+            content = content.replace('scripts/uu-native-service.py', 'scripts/uuway_daemon.py')
+            content = content.replace(' --allow-display-reconfigure', '').replace(' --preserve-display-session', '')
+            content += '\nAlias=uuway.service\n'
+        if ('niri' in os.environ.get('XDG_CURRENT_DESKTOP', '').lower().split(':') and
+                unit.name == 'uu-native-bridge.service'):
+            content = content.replace('Wants=uu-native-text.service\n', '').replace('After=uu-native-text.service\n', '')
+            # The niri port exposes the active physical mode only. Do not
+            # advertise GNOME virtual-display/reconfiguration capabilities.
+            content = content.replace(' --allow-display-reconfigure', '')
         fd, temporary = tempfile.mkstemp(prefix='.uurb-service-', dir=unit_dir)
         try:
             with os.fdopen(fd, 'w') as stream:
@@ -126,6 +153,8 @@ if __name__ == '__main__':
                         help='Keep the saved cursor mode when omitted (fresh install: metadata)')
     parser.add_argument('--preserve-display-session', action=argparse.BooleanOptionalAction, default=None,
                         help='Keep the installed main-unit policy when omitted; explicit enable requires geometry support')
+    parser.add_argument('--backend', choices=('nvidia', 'amd'),
+                        help='Persist the selected GPU backend in the user runtime config')
     args = parser.parse_args()
     install(args.bundle, args.prefix, args.restore_state, args.state_parent, args.text_socket, args.cursor_mode,
-            args.preserve_display_session)
+            args.preserve_display_session, args.backend)

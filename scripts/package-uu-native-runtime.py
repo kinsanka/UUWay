@@ -25,6 +25,31 @@ INPUTS = {
     'dxvk.conf': 'config/dxvk-native.conf',
     'licenses/DXVK_LICENSE': 'build/dxvk-capture/stage/DXVK_LICENSE',
 }
+BACKENDS = ('nvidia', 'amd')
+
+
+def backend_inputs(backend, inputs):
+    """Return source paths for a backend-specific build, with legacy fallback.
+
+    Releases contain both builds below ``build/backends``.  A checkout made by an
+    older release still has the single ``build`` tree, so keep accepting that
+    layout while it is being upgraded.
+    """
+    if backend is None:
+        return dict(inputs)
+    if backend not in BACKENDS:
+        raise ValueError('Unknown encoder backend: ' + str(backend))
+    root = ROOT / 'build' / 'backends' / backend
+    if not root.is_dir():
+        return dict(inputs)
+    result = {}
+    for name, source in inputs.items():
+        source = Path(source)
+        if source.parts[:1] == ('build',) and source.parts[1] in ('native-presenter', 'dxvk-capture', 'helpers'):
+            result[name] = str(Path('build/backends') / backend / Path(*source.parts[1:]))
+        else:
+            result[name] = source
+    return result
 CONTRACT = {
     'schema_version': 1,
     'capture_boundary': 'IDXGIOutput1/5 + IDXGIOutputDuplication',
@@ -162,13 +187,26 @@ CONTRACT = dict(FAILURE_CONTRACT, schema_version=29, **PRESET_RECONFIGURE_FIELDS
 PRESET_INPUT_CONTRACT = INPUT_CONTRACT
 PINNED_MAIN_SCRIPTS = {('scripts/' + name): ('scripts/' + name) for name in (
     'uu-native-service.py', 'uu-native-trial.py', 'uu-native-capture-broker.py',
-    'probe-wayland-portal.py', 'native_runtime_state.py',
+    'probe-wayland-portal.py', 'mutter-direct-capture.py', 'native_runtime_state.py',
     'native_display_confirmation.py', 'package-uu-native-runtime.py')}
 # The supervisor applies the default cover from inside its immutable bundle.
 # Keep the artwork beside the pinned Python entrypoints so a source-only
 # repack cannot accidentally point a new service at a missing development
 # checkout asset.
 PINNED_MAIN_SCRIPTS['assets/uuway-penguin.bmp'] = 'assets/uuway-penguin.bmp'
+PINNED_MAIN_SCRIPTS['scripts/native_niri_display.py'] = 'scripts/native_niri_display.py'
+PINNED_MAIN_SCRIPTS['scripts/uuway_platform.py'] = 'scripts/uuway_platform.py'
+PINNED_MAIN_SCRIPTS['scripts/native_umbriel_display.py'] = 'scripts/native_umbriel_display.py'
+PINNED_MAIN_SCRIPTS['capture/uu-umbriel-cursor-meta.so'] = 'capture/uu-umbriel-cursor-meta.so'
+UNIFIED_COMPONENTS = {
+    'runtime/uu-clipboard-pipe.exe': 'build/native-presenter/uu-clipboard-pipe.exe',
+    **{'scripts/' + name: 'scripts/' + name for name in (
+        'uuway_daemon.py', 'uu-wayland-clipboard.py', 'uu-native-display-service.py',
+        'native_display_config.py', 'native_display_guardian.py', 'native_display_topology.py',
+        'native_virtual_display.py', 'native_launcher_migration.py', 'native_text_portal.py',
+        'native_text_revision.py')},
+}
+PINNED_MAIN_SCRIPTS.update(UNIFIED_COMPONENTS)
 INPUT_CONTRACT = dict(PRESET_INPUT_CONTRACT, schema_version=30,
     main_runtime_sources='versioned_bundle_Python_entrypoint_supervisor_broker_portal_wrapper_and_imports',
     independent_service_sources='text_and_display_guardian_not_migrated',
@@ -211,6 +249,8 @@ INPUT_BRIDGE_COMPONENT = 'runtime/native-input-bridge.dll'
 DISPLAY_SET_EXPORT = b'UurbInputBridgeDisplaySetVersion'
 DISPLAY_DPI_V2_EXPORT = b'UurbInputBridgeDisplayDpiV2Version'
 DISPLAY_QUERY_V2_EXPORT = b'UurbDisplayQueryV2'
+VIRTUAL_BRIDGE_EXPORT = b'UurbInputBridgeVirtualVersion'
+VIRTUAL_CONTROL_EXPORT = b'UurbVirtualControl'
 # Schema 35 deliberately advertised DPI as unsupported.  Keep that exact
 # contract accepted for rollback, and publish DPI support as a new immutable
 # contract only when all three display-side runtime artifacts are replaced
@@ -227,6 +267,19 @@ DPI_V2_INPUT_CONTRACT = dict(DPI_INPUT_CONTRACT, schema_version=37,
     dpi_boundary='DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE_and_SET_DPI_SCALE_to_native_guardian_v2',
     dpi_discrete_scale_mask=True, dpi_sparse_get_unsupported=True,
     display_binary_exports=['UurbInputBridgeDisplayDpiV2Version', 'UurbDisplayQueryV2'])
+VIRTUAL_INPUT_CONTRACT = dict(DPI_V2_INPUT_CONTRACT, schema_version=40,
+    input_boundary='USER32 SendInput import + native desktop uinput',
+    display_geometry_queries='native_multi_output_USER32_CCD_and_DXGI_per_connector',
+    display_unsupported=['CDS_NORESET_deferred_changes', 'CCD_database_save_or_topology_changes',
+                         'multi_output_SetDisplayConfig', 'multi_output_DPI_changes', 'rotation_or_arbitrary_physical_timing'],
+    virtual_display_discovery='same_UID_Mutter_backed_IDD_device_interface',
+    virtual_display_emulation=True,
+    virtual_display_control='reviewed_0x30c004_008_00c_010_014_bounded_user_space_messages',
+    virtual_display_lifetime='pidfd_bound_UU_broker_supervisor; 15s_video_track_quiet_window; physical_restore_on_normal_and_forced_stop',
+    virtual_display_topology='reviewed_CCD_owned_virtual_selection_and_saved_physical_restore; temporary_Mutter_only',
+    display_max_refresh_hz=144,
+    cursor_boundary='per_output_DXGI_metadata_and_merged_desktop_USER32_snapshot',
+    display_session_preserving_reconfiguration='per_output_fresh_capture_and_GPU_ACK_with_guarded_rollback')
 DISPLAY_RUNTIME_COMPONENTS = (
     'runtime/native-input-bridge.dll',
     'runtime/uurb-native-display-loader.dll',
@@ -237,6 +290,16 @@ DISPLAY_RUNTIME_SOURCE_NAMES = {
     'runtime/uurb-native-display-loader.dll': 'uurb-native-display-loader.dll',
     'runtime/uurb-native-display.dll.so': 'uurb-native-display.dll.so',
 }
+
+
+VAAPI_FIELDS = dict(encoder_backend='amd-vaapi', gpu_message_version=4,
+    pixel_transport='size_sealed_memfd_bgra_host_copy', gpu_zero_copy=False,
+    encoder_reconfigure='close_and_reopen_between_frames_force_IDR',
+    spatial_aq='32_luma_variance_regions_vaapi_qp_delta',
+    unsupported_encoder_modes=RATE_CONTRACT_FIELDS['unsupported_encoder_modes'] + ['temporal_AQ', 'multipass'])
+VAAPI_INPUT_CONTRACT = dict(INPUT_CONTRACT, schema_version=38, **VAAPI_FIELDS)
+VAAPI_CONTRACT = dict(CONTRACT, schema_version=39, **VAAPI_FIELDS)
+VAAPI_VIRTUAL_INPUT_CONTRACT = dict(VIRTUAL_INPUT_CONTRACT, schema_version=41, **VAAPI_FIELDS)
 
 
 def digest(path):
@@ -427,6 +490,12 @@ def display_runtime_contract(sources):
     bridge_v2 = has_export(verify_pe_export, bridge, DISPLAY_DPI_V2_EXPORT)
     loader_v2 = has_export(verify_pe_export, loader, DISPLAY_QUERY_V2_EXPORT)
     winelib_v2 = has_export(verify_elf_export, winelib, DISPLAY_QUERY_V2_EXPORT)
+    if has_export(verify_pe_export, bridge, VIRTUAL_BRIDGE_EXPORT):
+        if not (bridge_v2 and loader_v2 and winelib_v2 and
+                has_export(verify_pe_export, loader, VIRTUAL_CONTROL_EXPORT) and
+                has_export(verify_elf_export, winelib, VIRTUAL_CONTROL_EXPORT)):
+            raise ValueError('Virtual display replacement requires matching bridge, loader and Winelib exports')
+        return VIRTUAL_INPUT_CONTRACT
     if bridge_v2:
         if not (loader_v2 and winelib_v2):
             raise ValueError('DPI v2 display replacement requires matching UurbDisplayQueryV2 exports in loader and Winelib')
@@ -445,7 +514,7 @@ def verify(directory):
         raise ValueError('Invalid bundle manifest')
     manifest = json.loads(manifest_file.read_text())
     contract = manifest.get('contract')
-    if contract not in (CONTRACT, INPUT_CONTRACT, DPI_INPUT_CONTRACT, DPI_V2_INPUT_CONTRACT, DEFERRED_IME_INPUT_CONTRACT, COMPOSITED_INPUT_CONTRACT, NATIVE_IME_INPUT_CONTRACT, SOURCE_PINNED_INPUT_CONTRACT, PRESET_INPUT_CONTRACT, FAILURE_CONTRACT, FAILURE_INPUT_CONTRACT, PINNED_CONTRACT, PINNED_INPUT_CONTRACT, LIFECYCLE_CONTRACT, LIFECYCLE_INPUT_CONTRACT, SOURCE_TIMING_CONTRACT, SOURCE_TIMING_INPUT_CONTRACT, PRE_TIMING_CONTRACT, RECREATE_INPUT_CONTRACT, GEOMETRY_INPUT_CONTRACT, VIRTUAL_TRACE_INPUT_CONTRACT, PADDED_TEXT_INPUT_CONTRACT, TEXT_DIAGNOSTIC_INPUT_CONTRACT, DEFAULT_DISPLAY_INPUT_CONTRACT, META_INPUT_CONTRACT, SETTINGS_INPUT_CONTRACT, GPU_CONFIRM_INPUT_CONTRACT, EMBEDDED_INPUT_CONTRACT, DISPLAY_INPUT_CONTRACT, SERVICE_INPUT_CONTRACT, REVISION_INPUT_CONTRACT, PURE_TEXT_INPUT_CONTRACT, CURSOR_INPUT_CONTRACT, RATE_INPUT_CONTRACT, REFERENCE_CONTRACT, REFERENCE_INPUT_CONTRACT, *LEGACY_DISPLAY_SET_CONTRACTS) or set(manifest) != {'contract', 'files'}:
+    if contract not in (VIRTUAL_INPUT_CONTRACT, VAAPI_VIRTUAL_INPUT_CONTRACT, VAAPI_CONTRACT, VAAPI_INPUT_CONTRACT, CONTRACT, INPUT_CONTRACT, DPI_INPUT_CONTRACT, DPI_V2_INPUT_CONTRACT, DEFERRED_IME_INPUT_CONTRACT, COMPOSITED_INPUT_CONTRACT, NATIVE_IME_INPUT_CONTRACT, SOURCE_PINNED_INPUT_CONTRACT, PRESET_INPUT_CONTRACT, FAILURE_CONTRACT, FAILURE_INPUT_CONTRACT, PINNED_CONTRACT, PINNED_INPUT_CONTRACT, LIFECYCLE_CONTRACT, LIFECYCLE_INPUT_CONTRACT, SOURCE_TIMING_CONTRACT, SOURCE_TIMING_INPUT_CONTRACT, PRE_TIMING_CONTRACT, RECREATE_INPUT_CONTRACT, GEOMETRY_INPUT_CONTRACT, VIRTUAL_TRACE_INPUT_CONTRACT, PADDED_TEXT_INPUT_CONTRACT, TEXT_DIAGNOSTIC_INPUT_CONTRACT, DEFAULT_DISPLAY_INPUT_CONTRACT, META_INPUT_CONTRACT, SETTINGS_INPUT_CONTRACT, GPU_CONFIRM_INPUT_CONTRACT, EMBEDDED_INPUT_CONTRACT, DISPLAY_INPUT_CONTRACT, SERVICE_INPUT_CONTRACT, REVISION_INPUT_CONTRACT, PURE_TEXT_INPUT_CONTRACT, CURSOR_INPUT_CONTRACT, RATE_INPUT_CONTRACT, REFERENCE_CONTRACT, REFERENCE_INPUT_CONTRACT, *LEGACY_DISPLAY_SET_CONTRACTS) or set(manifest) not in ({'contract', 'files'}, {'contract', 'files', 'backend'}):
         raise ValueError('Unreviewed bridge contract')
     # Feature fields are inspected only AFTER exact known-contract matching.
     # This keeps old releases usable without broadening accepted manifests.
@@ -460,6 +529,24 @@ def verify(directory):
         # remain verifiable and reusable; new releases always carry it.
         if 'assets/uuway-penguin.bmp' not in manifest['files']:
             inputs.pop('assets/uuway-penguin.bmp', None)
+        # This wrapper was added with multi-output capture. Old immutable
+        # bundles did not need it; keep them verifiable for update/rollback.
+        if (contract not in (VIRTUAL_INPUT_CONTRACT, VAAPI_VIRTUAL_INPUT_CONTRACT) and
+                'scripts/mutter-direct-capture.py' not in manifest['files']):
+            inputs.pop('scripts/mutter-direct-capture.py', None)
+    # Preserve verification of older immutable bundles without this adapter.
+    if 'scripts/native_umbriel_display.py' not in manifest['files']:
+        inputs.pop('scripts/native_umbriel_display.py', None)
+    if 'capture/uu-umbriel-cursor-meta.so' not in manifest['files']:
+        inputs.pop('capture/uu-umbriel-cursor-meta.so', None)
+    # Older immutable bundles remain verifiable for rollback. A partial new
+    # supervisor group is rejected; it must carry every pinned dependency.
+    present_unified = set(manifest['files']) & set(UNIFIED_COMPONENTS)
+    if present_unified and present_unified != set(UNIFIED_COMPONENTS):
+        raise ValueError('Incomplete unified supervisor components')
+    if not present_unified:
+        for name in UNIFIED_COMPONENTS:
+            inputs.pop(name, None)
     if set(manifest['files']) != set(inputs):
         raise ValueError('Missing or unexpected bridge component')
     for name, expected in manifest['files'].items():
@@ -471,9 +558,13 @@ def verify(directory):
             raise ValueError('Bundle paths must not cross symlinks')
         if digest(component) != expected:
             raise ValueError('Changed bridge component: ' + name)
-    has_display_set = contract in (INPUT_CONTRACT, DPI_INPUT_CONTRACT, DPI_V2_INPUT_CONTRACT)
+    if contract in (VIRTUAL_INPUT_CONTRACT, VAAPI_VIRTUAL_INPUT_CONTRACT):
+        verify_pe_export(directory / INPUT_BRIDGE_COMPONENT, VIRTUAL_BRIDGE_EXPORT, 'Input bridge')
+        verify_pe_export(directory / 'runtime/uurb-native-display-loader.dll', VIRTUAL_CONTROL_EXPORT, 'Display loader')
+        verify_elf_export(directory / 'runtime/uurb-native-display.dll.so', VIRTUAL_CONTROL_EXPORT)
+    has_display_set = contract in (VIRTUAL_INPUT_CONTRACT, VAAPI_VIRTUAL_INPUT_CONTRACT, VAAPI_INPUT_CONTRACT, INPUT_CONTRACT, DPI_INPUT_CONTRACT, DPI_V2_INPUT_CONTRACT)
     if has_display_set:
-        if contract == DPI_V2_INPUT_CONTRACT:
+        if contract in (DPI_V2_INPUT_CONTRACT, VIRTUAL_INPUT_CONTRACT, VAAPI_VIRTUAL_INPUT_CONTRACT):
             verify_pe_export(directory / INPUT_BRIDGE_COMPONENT, DISPLAY_DPI_V2_EXPORT, 'Input bridge')
             verify_pe_export(directory / 'runtime/uurb-native-display-loader.dll', DISPLAY_QUERY_V2_EXPORT,
                              'Display loader')
@@ -490,7 +581,8 @@ def verify(directory):
                 native_display_included='display_native_abi_version' in contract,
                 native_display_set_config_included=has_display_set,
                 native_display_abi_version=contract.get('display_native_abi_version', 0),
-                native_display_dpi_v2_included=contract == DPI_V2_INPUT_CONTRACT,
+                native_display_dpi_v2_included=contract in (DPI_V2_INPUT_CONTRACT, VIRTUAL_INPUT_CONTRACT, VAAPI_VIRTUAL_INPUT_CONTRACT),
+                native_virtual_display_included=contract.get('virtual_display_emulation', False),
                 legacy_display_set_config_claim_unverified=contract in LEGACY_DISPLAY_SET_CONTRACTS,
                 native_embedded_cursor_included='cursor_embedded_policy_field' in contract,
                 native_composited_cursor_included='cursor_composited_policy_field' in contract,
@@ -498,9 +590,11 @@ def verify(directory):
                 native_gpu_display_confirmation_included='display_confirmation_is_remote_presentation_proof' in contract,
                 native_input_settings_included='input_settings_version' in contract,
                 native_display_geometry_included='display_geometry_queries' in contract,
-                native_source_timing_included=contract.get('gpu_message_version') == 3,
+                native_source_timing_included=contract.get('gpu_message_version') in (3, 4),
                 native_capture_producer_included='capture_producer' in contract,
                 native_main_scripts_included='main_runtime_sources' in contract,
+                encoder_backend=contract.get('encoder_backend', 'nvidia-nvenc'),
+                backend=manifest.get('backend', 'amd' if contract.get('encoder_backend') == 'amd-vaapi' else 'nvidia'),
                 uu_session_tested=False, production_ready=False)
 
 
@@ -520,7 +614,8 @@ REPLACEABLE_COMPONENTS = (
 
 
 def package(parent, with_input=False, reuse_runtime_from=None, replace_input_bridge=None,
-            replace_display_runtime=None, replace_capture_backend=None, replace_components=None):
+            replace_display_runtime=None, replace_capture_backend=None, replace_components=None,
+            backend=None):
     replace_components = dict(replace_components or {})
     if replace_capture_backend is not None:
         replace_components[CAPTURE_BACKEND_COMPONENT] = replace_capture_backend
@@ -556,18 +651,19 @@ def package(parent, with_input=False, reuse_runtime_from=None, replace_input_bri
         stage = Path(temporary) / 'bundle'
         stage.mkdir(mode=0o700)
         inputs = dict(INPUTS, **INPUT_RUNTIME, **PINNED_CAPTURE, **PINNED_MAIN_SCRIPTS) if with_input else dict(INPUTS, **PINNED_CAPTURE)
-        sources = {name: ROOT / source for name, source in inputs.items()}
+        source_inputs = backend_inputs(backend, inputs)
+        sources = {name: ROOT / source for name, source in source_inputs.items()}
         contract = INPUT_CONTRACT if with_input else CONTRACT
         if reuse_runtime_from is not None:
             verify(reuse_runtime_from)
             base_contract = json.loads((reuse_runtime_from / 'manifest.json').read_text())['contract']
-            if not with_input or base_contract not in (SOURCE_PINNED_INPUT_CONTRACT, NATIVE_IME_INPUT_CONTRACT, COMPOSITED_INPUT_CONTRACT, DEFERRED_IME_INPUT_CONTRACT, INPUT_CONTRACT, DPI_INPUT_CONTRACT, DPI_V2_INPUT_CONTRACT, *LEGACY_DISPLAY_SET_CONTRACTS):
+            if not with_input or base_contract not in (SOURCE_PINNED_INPUT_CONTRACT, NATIVE_IME_INPUT_CONTRACT, COMPOSITED_INPUT_CONTRACT, DEFERRED_IME_INPUT_CONTRACT, INPUT_CONTRACT, DPI_INPUT_CONTRACT, DPI_V2_INPUT_CONTRACT, VIRTUAL_INPUT_CONTRACT, *LEGACY_DISPLAY_SET_CONTRACTS):
                 raise ValueError('Source-only update requires a compatible source-pinned runtime')
             sources.update({name: reuse_runtime_from / name for name in inputs if name not in PINNED_MAIN_SCRIPTS})
             # Only reviewed Python-only capabilities may advance here: 30->31
             # and 32->33. Schema34's native claim was invalid; repair it to33.
-            if base_contract == DPI_V2_INPUT_CONTRACT:
-                contract = DPI_V2_INPUT_CONTRACT
+            if base_contract in (DPI_V2_INPUT_CONTRACT, VIRTUAL_INPUT_CONTRACT):
+                contract = base_contract
             elif base_contract == DPI_INPUT_CONTRACT:
                 contract = DPI_INPUT_CONTRACT
             elif base_contract == INPUT_CONTRACT:
@@ -578,23 +674,23 @@ def package(parent, with_input=False, reuse_runtime_from=None, replace_input_bri
                 contract = NATIVE_IME_INPUT_CONTRACT
             if replace_input_bridge is not None:
                 if base_contract not in (DEFERRED_IME_INPUT_CONTRACT, INPUT_CONTRACT,
-                                         DPI_INPUT_CONTRACT, DPI_V2_INPUT_CONTRACT):
+                                         DPI_INPUT_CONTRACT, DPI_V2_INPUT_CONTRACT, VIRTUAL_INPUT_CONTRACT):
                     raise ValueError('Input bridge replacement requires a verified schema33/35/36/37 runtime')
                 sources[INPUT_BRIDGE_COMPONENT] = replace_input_bridge
                 # Preserve the display ABI of the reused runtime.  A v2
                 # bridge cannot be paired with a v1 loader, and downgrading a
                 # v2 bundle would silently remove the complete mode list.
-                if base_contract == DPI_V2_INPUT_CONTRACT:
+                if base_contract in (DPI_V2_INPUT_CONTRACT, VIRTUAL_INPUT_CONTRACT):
                     verify_pe_export(sources[INPUT_BRIDGE_COMPONENT], DISPLAY_DPI_V2_EXPORT,
                                      'Input bridge')
-                    contract = DPI_V2_INPUT_CONTRACT
+                    contract = base_contract
                 else:
                     if has_export(verify_pe_export, sources[INPUT_BRIDGE_COMPONENT], DISPLAY_DPI_V2_EXPORT):
                         raise ValueError('Input bridge replacement requires matching DPI v2 display runtime')
                     verify_display_set_bridge(sources[INPUT_BRIDGE_COMPONENT])
                     contract = DPI_INPUT_CONTRACT if base_contract == DPI_INPUT_CONTRACT else INPUT_CONTRACT
             if replace_display_runtime is not None:
-                if base_contract not in (INPUT_CONTRACT, DPI_INPUT_CONTRACT, DPI_V2_INPUT_CONTRACT):
+                if base_contract not in (INPUT_CONTRACT, DPI_INPUT_CONTRACT, DPI_V2_INPUT_CONTRACT, VIRTUAL_INPUT_CONTRACT):
                     raise ValueError('Display runtime replacement requires a verified schema35/36/37 runtime')
                 for name in DISPLAY_RUNTIME_COMPONENTS:
                     sources[name] = replace_display_runtime / DISPLAY_RUNTIME_SOURCE_NAMES[name]
@@ -603,23 +699,33 @@ def package(parent, with_input=False, reuse_runtime_from=None, replace_input_bri
                 if name not in sources:
                     raise ValueError('Component is not part of this bundle: ' + name)
                 sources[name] = source
-        if with_input and contract in (INPUT_CONTRACT, DPI_INPUT_CONTRACT, DPI_V2_INPUT_CONTRACT):
-            if contract == DPI_V2_INPUT_CONTRACT:
+        if with_input and reuse_runtime_from is None and has_export(verify_pe_export, sources[INPUT_BRIDGE_COMPONENT], VIRTUAL_BRIDGE_EXPORT):
+            contract = display_runtime_contract(sources)
+        if with_input and contract in (INPUT_CONTRACT, DPI_INPUT_CONTRACT, DPI_V2_INPUT_CONTRACT, VIRTUAL_INPUT_CONTRACT):
+            if contract in (DPI_V2_INPUT_CONTRACT, VIRTUAL_INPUT_CONTRACT, VAAPI_VIRTUAL_INPUT_CONTRACT):
                 verify_pe_export(sources[INPUT_BRIDGE_COMPONENT], DISPLAY_DPI_V2_EXPORT, 'Input bridge')
                 verify_pe_export(sources['runtime/uurb-native-display-loader.dll'], DISPLAY_QUERY_V2_EXPORT,
                                  'Display loader')
                 verify_elf_export(sources['runtime/uurb-native-display.dll.so'], DISPLAY_QUERY_V2_EXPORT)
             else:
                 verify_display_set_bridge(sources[INPUT_BRIDGE_COMPONENT])
+        marker = ROOT / 'build/encoder-backend'
+        selected_amd = backend == 'amd' or (backend is None and marker.is_file() and marker.read_text().strip() == 'amd-vaapi')
+        if selected_amd:
+            if reuse_runtime_from is not None:
+                raise ValueError('AMD transport must be packaged as a complete runtime, not mixed into a reused GPU bundle')
+            contract = (VAAPI_VIRTUAL_INPUT_CONTRACT if contract == VIRTUAL_INPUT_CONTRACT else VAAPI_INPUT_CONTRACT) if with_input else VAAPI_CONTRACT
+            sources['dxvk.conf'] = ROOT / 'config/dxvk-amd.conf'
         before = {name: digest(source) for name, source in sources.items()}
-        for name, source in inputs.items():
+        for name, source in source_inputs.items():
             destination = stage / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             digest(sources[name])
             shutil.copyfile(sources[name], destination)
             destination.chmod(0o700 if name == 'runtime/uu-native-input' or name in PINNED_CAPTURE else 0o600)
         manifest = dict(contract=contract,
-                        files={name: digest(stage / name) for name in inputs})
+                        files={name: digest(stage / name) for name in source_inputs})
+        manifest['backend'] = backend or ('amd' if selected_amd else 'nvidia')
         after = {name: digest(source) for name, source in sources.items()}
         if manifest['files'] != before or before != after:
             raise ValueError('Bridge artifacts changed while packaging; retry after the build completes')
@@ -647,6 +753,8 @@ if __name__ == '__main__':
     create = commands.add_parser('package')
     create.add_argument('parent', type=Path)
     create.add_argument('--with-input', action='store_true')
+    create.add_argument('--backend', choices=BACKENDS,
+                        help='Select the immutable GPU runtime (default: legacy marker/ NVIDIA)')
     create.add_argument('--reuse-runtime-from', type=Path,
                         help='Copy unchanged native components from a verified compatible bundle, updating only main scripts')
     create.add_argument('--replace-input-bridge', type=Path,
@@ -663,5 +771,6 @@ if __name__ == '__main__':
     print(json.dumps(package(args.parent, args.with_input, args.reuse_runtime_from,
                              args.replace_input_bridge, args.replace_display_runtime,
                              args.replace_capture_backend,
-                             dict(item.split('=', 1) for item in args.replace_component))
+                             dict(item.split('=', 1) for item in args.replace_component),
+                             args.backend)
                    if args.command == 'package' else verify(args.bundle), indent=2))

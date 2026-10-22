@@ -33,6 +33,11 @@ def completed(argv, code=0, out=""):
 
 class CliCase(unittest.TestCase):
     def setUp(self):
+        # This suite exercises Ubuntu/WineHQ behavior even on a Fedora host;
+        # Fedora-specific decisions are covered separately in test_fedora_port.
+        distro = patch.object(cli.platform, 'fedora', return_value=False)
+        distro.start()
+        self.addCleanup(distro.stop)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
@@ -161,6 +166,35 @@ class HelperSyncTests(CliCase):
 
 
 class RuntimeStepTests(CliCase):
+    def test_same_api_runtime_upgrade_also_reloads_display_fixes(self):
+        old, new = self.home / 'old-runtime', self.home / '.local/share/uuway/releases/abc'
+        for bundle in (old, new):
+            bundle.mkdir(parents=True)
+            (bundle / 'manifest.json').write_text(json.dumps({'contract': {'virtual_display_emulation': True}}))
+        ctx = self.run_runtime(config={'bundle': str(old)}, bridge_active=True)
+        self.assertTrue(ctx.restart_display)
+
+    def test_packaging_failure_preserves_the_running_bridge(self):
+        ctx = self.record_commands(self.context())
+        self.active.add('uu-native-bridge')
+        with patch.object(cli, 'package_bundle', side_effect=cli.SetupError('invalid runtime')):
+            with self.assertRaises(cli.SetupError):
+                self.quiet(cli.runtime_run, ctx)
+        self.assertFalse(any('stop' in command for command in self.commands))
+
+    def test_upgrade_to_virtual_display_api_restarts_only_display_before_bridge(self):
+        bundle = self.home / '.local/share/uuway/releases/abc'
+        bundle.mkdir(parents=True)
+        (bundle / 'manifest.json').write_text(json.dumps({'contract': {'virtual_display_emulation': True}}))
+        ctx = self.run_runtime(config={'bundle': str(self.home / 'old-runtime'), 'cursor_mode': 'composited'},
+                               bridge_active=True)
+        self.assertTrue(ctx.restart_display)
+        with patch.object(cli.time, 'sleep'):
+            self.quiet(cli.start_run, ctx)
+        restarts = [command[-1] for command in self.commands if 'restart' in command]
+        self.assertEqual(restarts, ['uu-native-display.service', 'uu-native-bridge.service'])
+        self.assertFalse(ctx.restart_display)
+
     def run_runtime(self, config=None, bridge_active=False, text_backend=None):
         ctx = self.record_commands(self.context())
         if config:
@@ -233,7 +267,7 @@ class RuntimeStepTests(CliCase):
         ctx = self.record_commands(self.stage_existing_install())
         before = self.snapshot(self.home)
         self.quiet(cli.helpers_run, ctx)  # the first step that replaces anything
-        backups = sorted(ctx.state_dir.glob("backup-*"))
+        backups = sorted((ctx.home / "backup/UUWay/安装升级").glob("backup-*"))
         self.assertEqual(len(backups), 1)
         saved = self.snapshot(backups[0] / "home")
         self.assertEqual(saved, {name: before[name] for name in saved})
@@ -250,7 +284,7 @@ class RuntimeStepTests(CliCase):
         self.assertEqual(backups[0].stat().st_mode & 0o777, 0o700)
         with patch.object(cli, "package_bundle", return_value=self.home / "bundle"):
             self.quiet(cli.runtime_run, ctx)
-        self.assertEqual(len(list(ctx.state_dir.glob("backup-*"))), 1, "one backup per run, not one per step")
+        self.assertEqual(len(list((ctx.home / "backup/UUWay/安装升级").glob("backup-*"))), 1, "one backup per run, not one per step")
 
     def test_the_documented_restore_command_really_restores_everything(self):
         ctx = self.record_commands(self.stage_existing_install())
@@ -258,9 +292,9 @@ class RuntimeStepTests(CliCase):
         self.quiet(cli.helpers_run, ctx)
         with patch.object(cli, "package_bundle", return_value=self.home / "bundle"):
             self.quiet(cli.runtime_run, ctx)
-        backup = next(ctx.state_dir.glob("backup-*"))
+        backup = next((ctx.home / "backup/UUWay/安装升级").glob("backup-*"))
         instructions = (backup / "RESTORE.txt").read_text()
-        self.assertIn("cp -a home/. ~/", instructions)
+        self.assertIn("cp -a --remove-destination --no-preserve=mode home/. ~/", instructions)
         self.assertIn("systemctl --user daemon-reload", instructions)
         restored = self.root / "restored-home"
         restored.mkdir()
@@ -275,13 +309,13 @@ class RuntimeStepTests(CliCase):
         ctx = self.stage_existing_install()
         ctx.dry_run = True
         self.quiet(cli.ensure_backup, ctx)
-        self.assertEqual(list(ctx.state_dir.glob("backup-*")), [])
+        self.assertEqual(list((ctx.home / "backup/UUWay/安装升级").glob("backup-*")), [])
 
     def test_steps_that_change_nothing_do_not_pile_up_backups(self):
         ctx = self.record_commands(self.stage_existing_install())
         self.quiet(cli.helpers_run, ctx)
         self.quiet(cli.helpers_run, self.record_commands(self.context()))  # a later, separate run
-        self.assertEqual(len(list(ctx.state_dir.glob("backup-*"))), 2)  # one per run that changed something
+        self.assertEqual(len(list((ctx.home / "backup/UUWay/安装升级").glob("backup-*"))), 2)  # one per run that changed something
         fresh = self.record_commands(self.context())
         self.assertTrue(cli.helpers_done(fresh))  # and a run that finds everything done has no step to back up
 
@@ -313,6 +347,13 @@ class RuntimeStepTests(CliCase):
 
 
 class StartStepTests(CliCase):
+    def test_explicit_restart_is_not_skipped_when_every_service_is_active(self):
+        self.active.update(cli.SERVICES)
+        self.assertTrue(cli.start_done(self.record_commands(self.context())))
+        for options in ({'restart_display': True}, {'restart_services': True}):
+            with self.subTest(options=options):
+                self.assertFalse(cli.start_done(self.record_commands(self.context(**options))))
+
     def start(self, **options):
         ctx = self.record_commands(self.context(**options))
         ctx.restart_bridge = True
@@ -327,6 +368,13 @@ class StartStepTests(CliCase):
     def test_only_the_bridge_is_restarted_by_default(self):
         self.start()
         self.assertEqual([c[-1] for c in self.restarts()], ["uu-native-bridge.service"])
+
+    def test_refresh_does_not_start_the_bridge_before_restarting_it(self):
+        self.start()
+        self.assertFalse(any('enable' in c and '--now' in c for c in self.commands))
+        starts = [c for c in self.commands if ('start' in c or 'restart' in c) and
+                  'uu-native-bridge.service' in c]
+        self.assertEqual(len(starts), 1)
 
     def test_restart_services_includes_text_and_display(self):
         self.start(restart_services=True)
@@ -488,6 +536,18 @@ class LauncherAndUninstallTests(CliCase):
 
 
 class StepSelectionTests(CliCase):
+    def test_packaged_refresh_retires_source_menu_but_source_refresh_keeps_it(self):
+        for packaged in (True, False):
+            with self.subTest(packaged=packaged):
+                seen = []
+                with patch.object(cli, 'ROOT', self.root), \
+                        patch.object(cli, 'DEB_ROOT', self.root if packaged else self.root / 'package'), \
+                        patch.object(cli, 'check_environment'), patch.object(cli, 'unit_active', return_value=False), \
+                        patch.object(cli, 'run_steps', side_effect=lambda ctx, only, force: seen.append(only)):
+                    args = cli.build_parser().parse_args(['refresh', '--yes', '--prefix', str(self.prefix)])
+                    self.quiet(cli.command_refresh, args)
+                self.assertEqual('launchers' in seen[0], packaged)
+
     def test_unknown_steps_are_rejected_with_the_valid_names(self):
         with self.assertRaises(cli.SetupError) as raised:
             cli.parse_steps("wine,nonsense")
@@ -736,6 +796,15 @@ class UpdateCase(CliCase):
 
 
 class UpdateCheckTests(UpdateCase):
+    def test_gui_check_json_is_structured_and_does_not_start_an_install(self):
+        ctx,args=self.update_context('check');args.json=True
+        code,output=self.quiet(cli.update_check,ctx,args)
+        value=json.loads(output)
+        self.assertTrue(value['available'])
+        self.assertTrue(value['installable'])
+        self.assertEqual(value['latest'],'1.2.1')
+        self.assertEqual(self.commands,[])
+
     def check(self):
         ctx, args = self.update_context("check")
         return ctx, self.quiet(cli.update_check, ctx, args)
@@ -1000,7 +1069,7 @@ class UpdateLaunchTests(UpdateCase):
     def test_the_user_files_are_snapshotted_before_the_launch(self):
         self.stage_snapshot_inputs()
         ctx, args, _ = self.install()
-        backups = sorted(ctx.state_dir.glob("backup-*"))
+        backups = sorted((ctx.home / "backup/UUWay/安装升级").glob("backup-*"))
         self.assertEqual(len(backups), 1)
         script = self.launched()[0]
         self.assertEqual(script[script.index("--snapshot") + 1], str(backups[0]))
@@ -1215,6 +1284,13 @@ class UpdateFollowTests(UpdateCase):
 
 
 class UpdateStatusTests(UpdateCase):
+    def test_gui_status_json_preserves_the_update_result(self):
+        self.result(outcome='rolled_back')
+        ctx,args=self.update_context('status');args.json=True
+        code,output=self.quiet(cli.update_status,ctx,args)
+        value=json.loads(output)
+        self.assertFalse(value['busy'])
+        self.assertEqual(value['result']['outcome'],'rolled_back')
     def result(self, **fields):
         data = dict(outcome="success", message="m", finished=time.time(), from_version="1.2.0", to_version="1.2.1")
         data.update(fields)
@@ -1377,6 +1453,11 @@ class InterruptTests(unittest.TestCase):
 
 
 class UpdateParserTests(unittest.TestCase):
+    def setUp(self):
+        distro = patch.object(cli.platform, "fedora", return_value=False)
+        distro.start()
+        self.addCleanup(distro.stop)
+
     def test_check_is_the_default_and_the_actions_exist(self):
         parser = cli.build_parser()
         self.assertEqual(parser.parse_args(["update"]).action, "check")
@@ -1653,6 +1734,70 @@ class AutologinTests(CliCase):
         output = start("y")
         self.assertIn("uu-native-text.service", " ".join(" ".join(c) for c in self.commands if "restart" in c))
         self.assertIn("十几秒内桌面和 UU 会回来", output)
+
+
+class UmbrielIntegrationTests(CliCase):
+    def setUp(self):
+        super().setUp()
+        desktop = patch.object(cli.platform, 'umbriel', return_value=True)
+        desktop.start()
+        self.addCleanup(desktop.stop)
+
+    def test_umbriel_reuses_its_own_portal_grant(self):
+        ctx = self.context()
+        self.assertEqual(ctx.restore_state, ctx.config_dir / 'portal-restore-umbriel.json')
+
+    def test_migration_stops_owned_peers_and_preserves_hevc_choice(self):
+        ctx = self.record_commands(self.context())
+        ctx.config_dir.mkdir(parents=True)
+        ctx.runtime_config.write_text('{"cursor_mode":"metadata"}')
+        codec = ctx.config_dir / 'video-codec.json'
+        codec.write_text('{"schema":1,"codec":"auto"}')
+        before = codec.read_bytes()
+        ctx.unit_dir.mkdir(parents=True)
+        for name in ('uu-native-display', 'uu-wayland-clipboard'):
+            (ctx.unit_dir / (name + '.service')).write_text(cli.SERVICE_MARKER + '\n')
+        override = ctx.unit_dir / 'uu-native-bridge.service.d/70-umbriel.conf'
+        override.parent.mkdir()
+        override.write_text('ExecStart=python3 /owned/uuway-umbriel/launch-bridge.py\n')
+        with patch.object(cli, 'package_bundle', return_value=self.home / 'new-bundle'):
+            self.quiet(cli.runtime_run, ctx)
+        self.assertEqual(codec.read_bytes(), before)
+        self.assertFalse(override.exists())
+        for name in ('uu-native-display', 'uu-wayland-clipboard'):
+            self.assertIn(['systemctl', '--user', 'disable', '--now', name + '.service'], self.commands)
+        saved = list((ctx.home / 'backup/UUWay/安装升级').glob('backup-*'))
+        self.assertEqual(len(saved), 1)
+        self.assertTrue((saved[0] / 'home' / override.relative_to(ctx.home)).is_file())
+
+    def test_new_umbriel_install_allows_hevc(self):
+        ctx = self.record_commands(self.context())
+        with patch.object(cli, 'package_bundle', return_value=self.home / 'new-bundle'):
+            self.quiet(cli.runtime_run, ctx)
+        self.assertEqual(json.loads((ctx.config_dir / 'video-codec.json').read_text()),
+                         {'schema': 1, 'codec': 'auto'})
+
+    def test_only_the_unified_service_starts(self):
+        ctx = self.record_commands(self.context())
+        ctx.restart_bridge = True
+        with patch.object(cli.time, 'sleep'), patch.object(cli, 'unit_active', return_value=True):
+            self.quiet(cli.start_run, ctx)
+        self.assertEqual(self.commands, [
+            ['systemctl', '--user', 'enable', 'uu-native-bridge.service'],
+            ['systemctl', '--user', 'restart', 'uu-native-bridge.service']])
+
+    def test_open_focuses_existing_uu_without_starting_another_wine(self):
+        ctx = self.context()
+        calls = []
+        def run(argv, **kwargs):
+            calls.append([str(x) for x in argv])
+            return completed(argv, out='[{"app_id":"gameviewer.exe","id":42}]')
+        ctx.run = run
+        with patch.object(cli, 'unit_active', return_value=True), \
+                patch.object(cli, 'backend_for_context', return_value='amd'):
+            self.quiet(cli.open_uu, ctx)
+        self.assertEqual(calls, [['/usr/bin/umbriel', 'windows', '--json'],
+                                 ['/usr/bin/umbriel', 'msg', 'window-focus:42']])
 
 
 class DoctorTests(CliCase):

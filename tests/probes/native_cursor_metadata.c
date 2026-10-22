@@ -69,6 +69,9 @@ int main(void)
     struct spa_data plane = {.chunk = &chunk};
     struct spa_buffer buffer = {.n_metas = 2, .metas = metas, .n_datas = 1, .datas = &plane};
     assert(uurb_cursor_only_buffer(&buffer));
+    metas[0].size = 1;
+    assert(uurb_cursor_only_buffer(&buffer));
+    metas[0].size = sizeof(meta);
     chunk.size = 1;
     assert(!uurb_cursor_only_buffer(&buffer));
     chunk.size = 0; header.flags = SPA_META_HEADER_FLAG_CORRUPTED;

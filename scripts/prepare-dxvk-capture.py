@@ -4,11 +4,18 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def prepare():
+    if Path('/etc/fedora-release').is_file():
+        for tool in ('x86_64-w64-mingw32-gcc', 'x86_64-w64-mingw32-g++', 'glslangValidator'):
+            if not shutil.which(tool):
+                raise RuntimeError('Missing Fedora build tool: ' + tool)
+        print('Using Fedora MinGW and glslang build tools.')
+        return
     manifest = json.loads((ROOT / 'config/dxvk-capture-dependencies.json').read_text())
     downloads = ROOT / 'build/gpu-relay/downloads'
     toolchain = ROOT / 'build/dxvk-capture/toolchain'

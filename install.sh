@@ -7,6 +7,9 @@
 set -Eeuo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f /etc/fedora-release ]]; then
+    exec bash "$repo_dir/scripts/install-fedora.sh" "$@"
+fi
 prefix="${UUWAY_PREFIX:-$HOME/.local/share/wineprefixes/uu-remote}"
 state_dir="$HOME/.local/state/uurb"
 config_dir="$HOME/.config/uurb"
@@ -22,11 +25,13 @@ assume_yes=0
 dry_run=0
 login=0
 with_console=1
+gpu_backend=""
 
 packages=(build-essential gcc-mingw-w64-x86-64 meson ninja-build pkg-config jq curl git ripgrep
           libjson-c-dev libx11-dev libxfixes-dev libpipewire-0.3-dev libspa-0.2-dev libvulkan-dev glslang-tools
           libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libfcitx5core-dev libfcitx5utils-dev
-          libei-dev fcitx5-modules-dev xvfb xclip python3-gi python3-dbus gir1.2-gtk-3.0 gir1.2-atspi-2.0)
+          libei-dev fcitx5-modules-dev xvfb xclip python3-gi python3-dbus gir1.2-gtk-3.0 gir1.2-atspi-2.0
+          libavcodec-dev libavutil-dev libswscale-dev libva-dev libva-utils libwine-dev)
 
 usage() {
     cat <<'EOF'
@@ -126,10 +131,10 @@ fi
 [[ "${XDG_SESSION_TYPE:-}" == wayland && "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]] ||
     die "请在 GNOME Wayland 会话里打开终端运行（当前会话：${XDG_SESSION_TYPE:-未知} / ${XDG_CURRENT_DESKTOP:-未知}）。"
 ok "GNOME Wayland 会话"
-if ! command -v nvidia-smi >/dev/null || ! nvidia-smi -L >/dev/null 2>&1; then
-    die "没有找到可用的 NVIDIA 显卡驱动。UUWay 需要支持 NVENC 的 NVIDIA 显卡和官方驱动。"
+if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
+    gpu_backend=nvidia
+    ok "NVIDIA 显卡：$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -1)"
 fi
-ok "NVIDIA 显卡：$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -1)"
 
 if should_run 1; then
     missing=()
@@ -161,6 +166,14 @@ if should_run 1; then
             die "装好的 WineHQ stable 不是 11 版（$("$wine_dir/wine" --version)）。"
     fi
 fi
+
+if [[ -z "$gpu_backend" ]] && compgen -G '/dev/dri/renderD*' >/dev/null && command -v vainfo >/dev/null &&
+    vainfo --display drm 2>/dev/null | grep -Eq 'VAProfile(H264|HEVC).*VAEntrypointEnc'; then
+    gpu_backend=amd
+    ok "AMD 显卡：VA-API H.264/HEVC 编码可用"
+fi
+[[ -n "$gpu_backend" ]] ||
+    die "没有找到可用的 NVIDIA NVENC 或 AMD VA-API 后端。请先安装对应显卡驱动；UUWay 不会自动安装或切换驱动。"
 
 # ---------------------------------------------------------------------------
 current_step=2
@@ -217,14 +230,23 @@ current_step=3
 if should_run 3; then
     step_title 3 "构建原生运行时（第一次需要十几分钟）"
     cd "$repo_dir"
-    # The build scripts read CUDA's driver-API header from this fixed path; no Ubuntu package provides it.
-    [[ -f /usr/local/cuda/include/cuda.h ]] || ((dry_run)) ||
-        die "缺少 /usr/local/cuda/include/cuda.h（CUDA 12.1 头文件）。获取方法见 docs/build.md 的 \"CUDA headers\"；不想自己构建的话，请直接安装发布页的 .deb。"
-    for script in build-dxvk-capture build-dxgi-capture-probe build-uu-native-bootstrap \
-                  build-uu-native-input build-uu-native-display build-native-ime build-helpers \
-                  build-pipewire-probe; do
-        run bash "scripts/$script.sh"
-    done
+    if [[ "$gpu_backend" == nvidia ]]; then
+        [[ -f /usr/local/cuda/include/cuda.h ]] || ((dry_run)) ||
+            die "缺少 /usr/local/cuda/include/cuda.h（CUDA 12.1 头文件）。AMD 用户不需要 CUDA；也可以直接安装发布页的 .deb。"
+        for script in build-dxvk-capture build-dxgi-capture-probe build-uu-native-bootstrap \
+                      build-uu-native-input build-uu-native-display build-native-ime build-helpers \
+                      build-pipewire-probe; do
+            run bash "scripts/$script.sh"
+        done
+    else
+        for script in build-dxvk-capture build-uu-native-bootstrap build-uu-native-input \
+                      build-uu-native-display build-native-ime build-helpers; do
+            run bash "scripts/$script.sh"
+        done
+        run env UURB_AMD_BASE="$repo_dir" bash scripts/build-amd-runtime.sh
+    fi
+    run mkdir -p "build/backends/$gpu_backend"
+    run cp -a build/dxvk-capture build/helpers build/native-presenter "build/backends/$gpu_backend/"
     if ((with_console)); then
         run bash scripts/build-uu-settings.sh
     fi
@@ -259,7 +281,8 @@ if should_run 5; then
     if [[ -s "$restore_state" ]]; then
         ok "屏幕共享已授权（$restore_state）"
     else
-        info "接下来会弹出屏幕共享对话框：请选择要串流给手机的显示器，并勾选「记住」。"
+        info "接下来会检查屏幕共享：请选择一块显示器，并勾选「记住」。"
+        info "运行后，UU 可切换当前 GNOME 会话的所有活动显示器，包括之后创建的超级屏。"
         run "$python" "$repo_dir/scripts/probe-wayland-portal.py" --capture-check --restore-state "$restore_state"
         ((dry_run)) || [[ -s "$restore_state" ]] || die "没有保存屏幕共享授权，请重新运行本步骤并勾选「记住」。"
         ok "屏幕共享已授权"
@@ -272,24 +295,28 @@ if should_run 6; then
     step_title 6 "打包并启动服务"
     cd "$repo_dir"
     if ((dry_run)); then
-        run "$python" scripts/package-uu-native-runtime.py package --with-input build/uu-native-releases
+        run "$python" scripts/package-uu-native-runtime.py package --with-input --backend "$gpu_backend" build/uu-native-releases
         bundle="$repo_dir/build/uu-native-releases/<sha256>"
     else
-        printf '   %s$ %s%s\n' "$dim" "$python scripts/package-uu-native-runtime.py package --with-input build/uu-native-releases" "$reset"
-        bundle="$("$python" scripts/package-uu-native-runtime.py package --with-input build/uu-native-releases | jq -r .bundle)"
+        printf '   %s$ %s%s\n' "$dim" "$python scripts/package-uu-native-runtime.py package --with-input --backend $gpu_backend build/uu-native-releases" "$reset"
+        bundle="$("$python" scripts/package-uu-native-runtime.py package --with-input --backend "$gpu_backend" build/uu-native-releases | jq -r .bundle)"
         [[ -d "$bundle" ]] || die "打包没有产生运行时目录。"
     fi
     ok "运行时：$bundle"
-    run "$python" scripts/install-uu-native-service.py \
-        --bundle "$bundle" --prefix "$prefix" --restore-state "$restore_state" \
-        --state-parent "$state_dir" --text-socket "$state_dir/text.sock" --cursor-mode metadata \
-        --preserve-display-session
-
-    # Apply Wine's Linux path view while the bridge is stopped.  Keeping this
-    # out of the long-lived service avoids racing Wine initialization on boot.
     if systemctl --user is-active --quiet uu-native-bridge 2>/dev/null; then
         run systemctl --user stop uu-native-bridge
     fi
+    service_options=()
+    if [[ ! -f "$config_dir/native-runtime.json" ]]; then
+        service_options=(--cursor-mode metadata --preserve-display-session)
+    fi
+    run "$python" scripts/install-uu-native-service.py \
+        --bundle "$bundle" --prefix "$prefix" --restore-state "$restore_state" \
+        --state-parent "$state_dir" --text-socket "$state_dir/text.sock" \
+        "${service_options[@]}" --backend "$gpu_backend"
+
+    # Apply Wine's Linux path view while the bridge is stopped. Keeping this
+    # out of the long-lived service avoids racing Wine initialization on boot.
     run "$python" scripts/configure-uu-wine-mappings.py \
         --prefix "$prefix" --config-directory "$config_dir"
     # The registry command starts a short-lived Wine server.  Reap it fully
@@ -311,6 +338,8 @@ if should_run 6; then
     fi
 
     run systemctl --user daemon-reload
+    info "加载多屏与超级屏显示服务（移除现有超级屏，保留文字服务）"
+    run systemctl --user restart uu-native-display
     run systemctl --user enable --now uu-native-display uu-native-text uu-native-bridge
     # A re-run brings in the new runtime.
     run systemctl --user restart uu-native-bridge
@@ -328,6 +357,7 @@ if should_run 7 && ((with_console)); then
     step_title 7 "安装控制台"
     run "$python" "$repo_dir/scripts/install-uu-settings.py"
     ok "已添加到应用菜单：UUWay 控制台"
+    info "显示页可管理多屏/超级屏；软件更新页可手动或自动检查更新（源码安装不支持 OTA 安装）"
 fi
 
 trap - ERR

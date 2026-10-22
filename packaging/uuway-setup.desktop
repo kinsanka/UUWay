@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=UUWay Setup
+Name[zh_CN]=UUWay 安装与修复
+Comment=Set up UU Remote on Fedora Umbriel
+Exec=/usr/lib/uuway/scripts/uuway-setup
+Icon=uuway
+Terminal=true
+Categories=Network;RemoteAccess;

@@ -4,9 +4,20 @@ from pathlib import Path
 import subprocess
 import unittest
 import tempfile
+import shlex
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get('UURB_TEST_CAPTURE_BINARY', str(ROOT / 'build/native-presenter/uu-pipewire-native-probe')))
+SYSROOT_INCLUDE = ROOT / 'build/portal-recovery/sysroot/usr/include'
+HAS_CAPTURE_HEADERS = (Path('/usr/include/spa-0.2').is_dir() or
+                       (SYSROOT_INCLUDE / 'spa-0.2').is_dir())
+
+
+def capture_headers():
+    if Path('/usr/include/spa-0.2').is_dir():
+        return shlex.split(subprocess.check_output(['pkg-config', '--cflags', 'libpipewire-0.3'], text=True))
+    return ['-isystem', str(SYSROOT_INCLUDE / 'spa-0.2'),
+            '-isystem', str(SYSROOT_INCLUDE / 'pipewire-0.3')]
 
 
 class NativePipewireProbeTests(unittest.TestCase):
@@ -34,16 +45,28 @@ class NativePipewireProbeTests(unittest.TestCase):
                 '-o', executable], check=True, capture_output=True, timeout=15)
             subprocess.run([executable], check=True, capture_output=True, timeout=5)
 
-    @unittest.skipUnless((ROOT / 'build/portal-recovery/sysroot/usr/include/spa-0.2').is_dir(),
-                         'Build the portal sysroot first (scripts/build-portal-lifetime.sh)')
+    @unittest.skipUnless(HAS_CAPTURE_HEADERS, 'Install PipeWire headers or build the portal sysroot')
     def test_bounded_cursor_metadata_without_video_pixel_mapping(self):
         with tempfile.TemporaryDirectory() as temporary:
             executable = str(Path(temporary) / 'cursor')
             subprocess.run(['gcc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
-                '-I', str(ROOT / 'src'), '-isystem', str(ROOT / 'build/portal-recovery/sysroot/usr/include/spa-0.2'),
+                '-I', str(ROOT / 'src'), *capture_headers(),
                 str(ROOT / 'src/native_cursor_metadata.c'), str(ROOT / 'tests/probes/native_cursor_metadata.c'),
                 '-o', executable], check=True, capture_output=True, timeout=15)
             subprocess.run([executable], check=True, capture_output=True, timeout=5)
+
+    @unittest.skipUnless(HAS_CAPTURE_HEADERS, 'Install PipeWire headers or build the portal sysroot')
+    def test_invalid_cursor_does_not_stop_valid_video_and_next_cursor_recovers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = str(Path(temporary) / 'isolation')
+            subprocess.run(['gcc', '-std=gnu11', '-O2', '-Wall', '-Wextra', '-Werror',
+                '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections',
+                '-I', str(ROOT / 'src'), *capture_headers(),
+                str(ROOT / 'tests/probes/cursor_video_isolation.c'),
+                str(ROOT / 'src/native_cursor_metadata.c'), '-o', executable],
+                check=True, capture_output=True, timeout=20)
+            result = subprocess.run([executable], check=True, capture_output=True, text=True, timeout=5)
+            self.assertIn('CURSOR_VIDEO_ISOLATION_PASS', result.stdout)
 
     @unittest.skipUnless(BINARY.is_file(), 'Build the native PipeWire probe first')
     def test_invalid_capture_size_rejected_before_gpu_initialization(self):
@@ -56,11 +79,19 @@ class NativePipewireProbeTests(unittest.TestCase):
 
     @unittest.skipUnless(BINARY.is_file(), 'Build the native PipeWire probe first')
     def test_invalid_capture_rate_rejected_before_gpu_initialization(self):
-        for rate in ['', '0', '-1', '121', '60/1', '60x']:
+        for rate in ['', '0', '-1', '145', '60/1', '60x']:
             result = subprocess.run([str(BINARY)], env=dict(os.environ, UURB_CAPTURE_MAX_FPS=rate),
                                     capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 2)
             self.assertIn('UURB_CAPTURE_MAX_FPS', result.stderr)
+
+    @unittest.skipUnless(BINARY.is_file(), 'Build the native PipeWire probe first')
+    def test_144_hz_reaches_fd_validation_instead_of_rejecting_the_refresh(self):
+        result = subprocess.run([str(BINARY)], env=dict(os.environ, UURB_CAPTURE_MAX_FPS='144'),
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('usage:', result.stderr)
+        self.assertNotIn('UURB_CAPTURE_MAX_FPS', result.stderr)
 
     def test_source_timing_handles_jitter_discontinuities_and_large_timestamps(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -131,8 +162,8 @@ class NativePipewireProbeTests(unittest.TestCase):
         self.assertIn('if (p->negotiated)', process)  # before negotiation nothing is judged or dropped
         # A superseded buffer is recycled, never encoded, and still feeds its cursor metadata.
         supersede = source[source.index('static void supersede_frame'):source.index('static void process(void *opaque)')]
-        self.assertIn('uurb_cursor_metadata', supersede)
-        self.assertLess(supersede.index('uurb_cursor_metadata'), supersede.index('pw_stream_queue_buffer'))
+        self.assertIn('update_cursor', supersede)
+        self.assertLess(supersede.index('update_cursor'), supersede.index('pw_stream_queue_buffer'))
         for forbidden in ('uurb_capture_encoder_frame', 'uurb_capture_encoder_cursor_frame', 'record_delivery'):
             self.assertNotIn(forbidden, supersede)
         self.assertIn('\\"superseded_frames\\":%u', source)

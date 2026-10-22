@@ -1,0 +1,21 @@
+name: Fedora Umbriel checks
+on:
+  push:
+    branches: [fedora-umbriel]
+  pull_request:
+    branches: [fedora-umbriel]
+permissions:
+  contents: read
+jobs:
+  lifecycle-and-packaging:
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+      - run: dnf install -y python3 python3-gobject python3-dbus gcc binutils git
+      - name: Hardware-independent acceptance tests
+        run: |
+          set -e
+          for suite in test_unified_supervisor test_native_service test_fedora_port test_native_runtime_package test_uuway_cli test_wayland_portal_probe; do
+            python3 -m unittest discover -s tests -p "$suite.py"
+          done

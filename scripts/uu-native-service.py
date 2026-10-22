@@ -200,6 +200,10 @@ class ClipboardBridge:
         self._log = None
 
     def start(self):
+        if trial.platform.fedora() and (trial.platform.niri() or trial.platform.umbriel()):
+            # This compatibility mode shares the desktop Xwayland clipboard;
+            # there is no private X clipboard to join to a second display.
+            return False
         if not (self.helper.is_file() and os.access(self.helper, os.X_OK)):
             return False
         self.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -535,11 +539,16 @@ def text_endpoint(config, config_directory):
     return text_configuration(config, config_directory)[1]
 
 
-def run(config_path, preserve_display_session=False, allow_display_reconfigure=False):
+def run(config_path, preserve_display_session=False, allow_display_reconfigure=False, *, stop_event=None, ready_callback=None):
     trial.private_directory(config_path.parent)
     config = trial.state_tools.read_private(config_path)
     names = {'schema', 'prefix', 'bundle', 'restore_state', 'state_parent', 'text_socket', 'cursor_mode'}
-    if set(config) != names or config['schema'] != 1 or config['cursor_mode'] not in ('metadata', 'embedded', 'composited'):
+    # The installer records the GPU backend for the package/console.  Keep the
+    # key optional so a rollback to an older source-only bundle, which did not
+    # write it, still starts.
+    if (set(config) not in (names, names | {'backend'}) or config['schema'] != 1 or
+            config['cursor_mode'] not in ('metadata', 'embedded', 'composited') or
+            config.get('backend') not in (None, 'nvidia', 'amd')):
         raise ValueError('Unreviewed native service configuration')
     for name in names - {'schema', 'cursor_mode'}:
         if not isinstance(config[name], str) or not Path(config[name]).is_absolute():
@@ -559,6 +568,9 @@ def run(config_path, preserve_display_session=False, allow_display_reconfigure=F
     backend, endpoint = text_configuration(config, config_path.parent)
     stopping = False
 
+    def requested():
+        return stopping or (stop_event is not None and stop_event.is_set())
+
     def request_stop(signum, frame):
         nonlocal stopping
         stopping = True
@@ -575,20 +587,21 @@ def run(config_path, preserve_display_session=False, allow_display_reconfigure=F
             trial.event('native_clipboard_bridge_started')
         remap_window = time.monotonic()
         remap_count = 0
-        while not stopping:
+        while not requested():
             try:
                 trial.run(Path(config['prefix']), bundle, Path(config['restore_state']),
                           Path(config['state_parent']), None, True, config['cursor_mode'], endpoint, 'user', display_socket,
                           preserve_display_session,
                           pending_native_ime=backend == 'fcitx' and verified.get('native_ime_deferred_start_included', False),
                           allow_display_reconfigure=allow_display_reconfigure,
-                          stop_requested=lambda: stopping)
+                          stop_requested=requested,
+                          **({'ready_callback': ready_callback} if ready_callback is not None else {}))
                 return
             except RuntimeError as error:
                 # Cleanup failures remain fail-closed, even during shutdown.
                 if str(error) != DISPLAY_REMAP_FAILURE:
                     raise
-                if stopping:
+                if requested():
                     return
                 now = time.monotonic()
                 if now - remap_window >= DISPLAY_REMAP_WINDOW_SECONDS:
@@ -598,7 +611,7 @@ def run(config_path, preserve_display_session=False, allow_display_reconfigure=F
                     raise
                 trial.event('native_service_display_reconnect', attempt=remap_count)
                 deadline = time.monotonic() + 1
-                while not stopping and time.monotonic() < deadline:
+                while not requested() and time.monotonic() < deadline:
                     time.sleep(min(0.05, max(0, deadline - time.monotonic())))
     finally:
         try:
@@ -624,5 +637,6 @@ if __name__ == '__main__':
         run(args.config, args.preserve_display_session, args.allow_display_reconfigure)
     except Exception as error:
         # No tracebacks: subprocess exceptions could contain private argv.
-        trial.event('native_service_failed', error_type=type(error).__name__)
+        import traceback
+        trial.event('native_service_failed', error_type=type(error).__name__, frames=[dict(file=Path(f.filename).name, line=f.lineno, function=f.name) for f in traceback.extract_tb(error.__traceback__)])
         raise SystemExit(1)

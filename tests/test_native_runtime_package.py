@@ -3,6 +3,7 @@ import importlib.util
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import struct
@@ -17,6 +18,75 @@ spec.loader.exec_module(package)
 
 
 class PackageIsolationTests(unittest.TestCase):
+    @staticmethod
+    def pe_exports(*names):
+        image = bytearray(PackageIsolationTests.pe_input_bridge())
+        struct.pack_into('<IIIII', image, 0x400 + 20, len(names), len(names), 0x2040, 0x2060, 0x2080)
+        position = 0x490
+        for index, name in enumerate(names):
+            encoded = name + b'\0'
+            struct.pack_into('<I', image, 0x440 + index * 4, 0x1000)
+            struct.pack_into('<I', image, 0x460 + index * 4, 0x2000 + position - 0x400)
+            struct.pack_into('<H', image, 0x480 + index * 2, index)
+            image[position:position + len(encoded)] = encoded
+            position += len(encoded)
+        return bytes(image)
+
+    @staticmethod
+    def elf_virtual_exports():
+        image = bytearray(PackageIsolationTests.elf_query_v2())
+        names = b'\0UurbDisplayQueryV2\0UurbVirtualControl\0'
+        image[0x300:0x300 + len(names)] = names
+        struct.pack_into('<Q', image, 0x100 + 64 + 32, len(names))
+        struct.pack_into('<Q', image, 0x100 + 128 + 32, 72)
+        struct.pack_into('<IBBHQQ', image, 0x340 + 48, len(b'\0UurbDisplayQueryV2\0'), 0x12, 0, 1, 0x110, 1)
+        return bytes(image)
+
+    def test_virtual_capability_requires_three_matching_native_artifacts_and_survives_repack(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            bridge = root / package.INPUT_RUNTIME[package.INPUT_BRIDGE_COMPONENT]
+            loader = root / package.INPUT_RUNTIME['runtime/uurb-native-display-loader.dll']
+            backend = root / package.INPUT_RUNTIME['runtime/uurb-native-display.dll.so']
+            bridge.write_bytes(self.pe_exports(package.DISPLAY_SET_EXPORT, package.DISPLAY_DPI_V2_EXPORT,
+                                              package.VIRTUAL_BRIDGE_EXPORT))
+            loader.write_bytes(self.pe_exports(package.DISPLAY_QUERY_V2_EXPORT, package.VIRTUAL_CONTROL_EXPORT))
+            backend.write_bytes(self.elf_virtual_exports())
+            with patch.object(package, 'ROOT', root):
+                release = package.package(root / 'releases', with_input=True)
+                self.assertTrue(release['native_virtual_display_included'])
+                bundle = Path(release['bundle'])
+                self.assertEqual(json.loads((bundle / 'manifest.json').read_text())['contract']['schema_version'], 40)
+                repacked = package.package(root / 'releases', with_input=True, reuse_runtime_from=bundle)
+                self.assertTrue(repacked['native_virtual_display_included'])
+                loader.write_bytes(self.pe_exports(package.DISPLAY_QUERY_V2_EXPORT))
+                with self.assertRaisesRegex(ValueError, 'Virtual display replacement requires matching'):
+                    package.package(root / 'releases', with_input=True)
+
+
+    def test_explicit_amd_bundle_preserves_backend_transport_and_quantization_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            (root / 'build/encoder-backend').write_text('amd-vaapi\n')
+            (root / 'config/dxvk-amd.conf').write_text('dxgi.customVendorId = 10de\n')
+            with patch.object(package, 'ROOT', root):
+                for with_input in (False, True):
+                    with self.subTest(with_input=with_input):
+                        release = package.package(root / 'releases', with_input=with_input)
+                        bundle = Path(release['bundle'])
+                        result = package.verify(bundle)
+                        self.assertEqual(result['encoder_backend'], 'amd-vaapi')
+                        self.assertTrue(result['native_source_timing_included'])
+                        self.assertEqual(result['native_display_set_config_included'], with_input)
+                        manifest = json.loads((bundle / 'manifest.json').read_text())
+                        self.assertEqual(manifest['contract']['gpu_message_version'], 4)
+                        self.assertFalse(manifest['contract']['gpu_zero_copy'])
+                        self.assertIn('temporal_AQ', manifest['contract']['unsupported_encoder_modes'])
+                        self.assertNotIn('AQ', manifest['contract']['unsupported_encoder_modes'])
+                        self.assertEqual((bundle / 'dxvk.conf').read_text(), 'dxgi.customVendorId = 10de\n')
+
     @staticmethod
     def pe_input_bridge(marker=True, machine=0x8664, export=None):
         """Return a small, non-loadable PE fixture with an export table.
@@ -414,7 +484,8 @@ class PackageIsolationTests(unittest.TestCase):
             path = root / source
             path.parent.mkdir(parents=True, exist_ok=True)
             if name in package.PINNED_MAIN_SCRIPTS:
-                path.write_bytes((ROOT / source).read_bytes())
+                original = ROOT / source
+                path.write_bytes(original.read_bytes() if original.is_file() else ('fixture:' + name).encode())
             elif name == package.INPUT_BRIDGE_COMPONENT:
                 path.write_bytes(self.pe_input_bridge())
             else:
@@ -429,6 +500,7 @@ class PackageIsolationTests(unittest.TestCase):
                 self.assertTrue(package.verify(bundle)['native_main_scripts_included'])
                 original = {name:(bundle/name).read_bytes() for name in package.PINNED_MAIN_SCRIPTS}
                 for name in package.PINNED_MAIN_SCRIPTS:
+                    (root/name).parent.mkdir(parents=True, exist_ok=True)
                     (root/name).write_bytes(b'raise RuntimeError("mutable development source must not run")\n')
                 for entry in ('uu-native-service.py','uu-native-trial.py','uu-native-capture-broker.py','probe-wayland-portal.py'):
                     result=subprocess.run(['/usr/bin/python3',str(bundle/'scripts'/entry),'--help'],
@@ -483,6 +555,28 @@ class PackageIsolationTests(unittest.TestCase):
                 installer.install(bundle, prefix, state/'portal.json', state, state/'text.sock',
                                   preserve_display_session=False)
                 self.assertFalse(installer.existing_display_policy(main.read_text()))
+
+    def test_umbriel_installs_one_closed_over_service_without_display_writes(self):
+        spec=importlib.util.spec_from_file_location('unified_installer',ROOT/'scripts/install-uu-native-service.py')
+        installer=importlib.util.module_from_spec(spec);spec.loader.exec_module(installer)
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);self.fixture(root)
+            with patch.object(package,'ROOT',root):
+                bundle=Path(package.package(root/'releases',with_input=True)['bundle'])
+            prefix=root/'prefix';prefix.mkdir(mode=0o700)
+            state=root/'state';state.mkdir(mode=0o700)
+            with patch.object(installer.Path,'home',return_value=root), \
+                    patch.dict(os.environ,{'XDG_CURRENT_DESKTOP':'umbriel'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                installer.install(bundle,prefix,state/'portal.json',state,state/'text.sock','metadata')
+            units=root/'.config/systemd/user'
+            self.assertEqual([p.name for p in units.glob('*.service')],['uu-native-bridge.service'])
+            content=(units/'uu-native-bridge.service').read_text()
+            self.assertIn(str(bundle/'scripts/uuway_daemon.py'),content)
+            self.assertIn('Alias=uuway.service',content)
+            self.assertNotIn('Wants=uu-native-display',content)
+            self.assertNotIn('Wants=uu-native-text',content)
+            self.assertNotIn('--allow-display-reconfigure',content)
 
     def test_managed_display_policy_does_not_guess_from_comments_or_unknown_options(self):
         spec = importlib.util.spec_from_file_location('policy_installer', ROOT/'scripts/install-uu-native-service.py')

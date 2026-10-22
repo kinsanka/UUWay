@@ -373,6 +373,15 @@ def main():
                 command.extend(['--gpu-relay', str(args.gpu_relay_fd)])
                 inherited += (args.gpu_relay_fd,)
             capture_env = dict(os.environ, UURB_CAPTURE_DURATION_SECONDS=str(args.duration_seconds))
+            if ('umbriel' in os.environ.get('XDG_CURRENT_DESKTOP', '').lower().split(':')
+                    and args.cursor_state_fd is not None):
+                shim = ROOT / 'capture/uu-umbriel-cursor-meta.so'
+                info = shim.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+                    raise RuntimeError('Expected a private-owner cursor negotiation library')
+                previous = capture_env.get('LD_PRELOAD', '')
+                capture_env['LD_PRELOAD'] = str(shim) + (' ' + previous if previous else '')
+
             capture_env.pop('UURB_CAPTURE_STATUS_FD', None)
             if args.capture_status_fd is not None:
                 inherited += (args.capture_status_fd,)

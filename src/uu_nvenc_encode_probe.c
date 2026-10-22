@@ -14,7 +14,8 @@ typedef NVENCSTATUS (NVENCAPI *create_fn)(NV_ENCODE_API_FUNCTION_LIST *);
 #define CHECK(test) do { if (!(test)) { fprintf(stderr, "ENCODE ABI check failed: %s line %d\n", #test, __LINE__); goto done; } } while (0)
 int main(int argc, char **argv)
 {
-    if (argc != 4 || (strcmp(argv[2], "bgra") && strcmp(argv[2], "nv12")) ||
+    if ((argc != 4 && !(argc == 5 && !strcmp(argv[4], "h264-only"))) ||
+        (strcmp(argv[2], "bgra") && strcmp(argv[2], "nv12")) ||
         (strcmp(argv[3], "sampled") && strcmp(argv[3], "rtv") && strcmp(argv[3], "uav"))) return 2;
     int nv12 = !strcmp(argv[2], "nv12"), result = 1;
     char negotiation_flag[2];
@@ -69,7 +70,7 @@ int main(int argc, char **argv)
             CHECK(SUCCEEDED(ID3D11Device_CreateRenderTargetView(device, (ID3D11Resource *)render_textures[i], &view, &targets[i][1])));
         }
     }
-    for (unsigned codec = 0; codec < 2; ++codec) {
+    for (unsigned codec = 0; codec < (argc == 5 ? 1u : 2u); ++codec) {
         GUID guid = codec ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
         const char *name = codec ? "hevc" : "h264";
         char filename[4096];
@@ -79,6 +80,14 @@ int main(int argc, char **argv)
         NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS open = {.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
             .deviceType = NV_ENC_DEVICE_TYPE_DIRECTX, .device = device, .apiVersion = NVENCAPI_VERSION};
         CHECK(api.nvEncOpenEncodeSessionEx(&open, &encoder) == NV_ENC_SUCCESS);
+        if (argc == 5) {
+            uint32_t codec_count = 0;
+            GUID available[2];
+            CHECK(api.nvEncGetEncodeGUIDCount(encoder, &codec_count) == NV_ENC_SUCCESS && codec_count == 1);
+            CHECK(api.nvEncGetEncodeGUIDs(encoder, available, 2, &codec_count) == NV_ENC_SUCCESS && codec_count == 1 &&
+                  !memcmp(available, &NV_ENC_CODEC_H264_GUID, sizeof(GUID)));
+            CHECK(api.nvEncGetInputFormatCount(encoder, NV_ENC_CODEC_HEVC_GUID, &codec_count) == NV_ENC_ERR_UNSUPPORTED_PARAM);
+        }
         /* Exercise every unsupported public slot through the real PE ABI. */
 #define REJECT_STRUCT(name, type) do { \
     type params, before; memset(&params, 0xa5, sizeof(params)); before = params; \
@@ -157,6 +166,27 @@ int main(int argc, char **argv)
         init.enableEncodeAsync = 0; init.frameRateNum = 241;
         CHECK(api.nvEncInitializeEncoder(encoder, &init) == NV_ENC_ERR_UNSUPPORTED_PARAM && init.frameRateNum == 241);
         init.frameRateNum = 60;
+        char amd_flag[2];
+        int amd_uu = GetEnvironmentVariableA("UURB_AMD_UU_PROBE", amd_flag, 2) == 1 && amd_flag[0] == '1';
+        if (amd_uu) {
+            config.gopLength = NVENC_INFINITE_GOPLENGTH;
+            config.rcParams.enableAQ = 1;
+            config.rcParams.disableIadapt = 1;
+            config.rcParams.lowDelayKeyFrameScale = 1;
+            if (codec) {
+                config.encodeCodecConfig.hevcConfig.idrPeriod = config.gopLength;
+                config.encodeCodecConfig.hevcConfig.chromaFormatIDC = 1;
+                config.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = 1;
+                config.encodeCodecConfig.hevcConfig.sliceMode = 3;
+                config.encodeCodecConfig.hevcConfig.sliceModeData = 1;
+            } else {
+                config.encodeCodecConfig.h264Config.idrPeriod = config.gopLength;
+                config.encodeCodecConfig.h264Config.chromaFormatIDC = 1;
+                config.encodeCodecConfig.h264Config.maxNumRefFrames = 1;
+                config.encodeCodecConfig.h264Config.sliceMode = 3;
+                config.encodeCodecConfig.h264Config.sliceModeData = 1;
+            }
+        }
         if (negotiated) {
             init.frameRateNum = codec ? 120 : 30000;
             init.frameRateDen = codec ? 1 : 1001;
@@ -276,6 +306,7 @@ int main(int argc, char **argv)
             CHECK(api.nvEncUnregisterResource(encoder, extra_inputs[i]) == NV_ENC_SUCCESS);
             CHECK(api.nvEncDestroyBitstreamBuffer(encoder, extra_outputs[i]) == NV_ENC_SUCCESS);
         }
+        ULONGLONG encode_begin_ms = GetTickCount64();
         for (unsigned frame = 0; frame < 64; ++frame) {
             if (frame == 32) {
                 if (negotiated) {
@@ -284,6 +315,9 @@ int main(int argc, char **argv)
                     config.rcParams.maxBitRate = 16000000;
                     config.rcParams.vbvBufferSize = 200000;
                     config.rcParams.vbvInitialDelay = 100000;
+                } else if (amd_uu) {
+                    config.rcParams.averageBitRate = config.rcParams.maxBitRate = 20000000;
+                    config.rcParams.vbvBufferSize = config.rcParams.vbvInitialDelay = 20000000 / 60;
                 } else uurb_nvenc_reference_config(&preset.presetCfg, 640, 360, codec, 20000000, &config, &init);
                 NV_ENC_RECONFIGURE_PARAMS change = {.version = NV_ENC_RECONFIGURE_PARAMS_VER,
                     .reInitEncodeParams = init, .resetEncoder = 1, .forceIDR = 1};
@@ -365,6 +399,8 @@ int main(int argc, char **argv)
                 }
             }
         }
+        printf("ENCODE_PERF {\"codec\":\"%s\",\"frames\":64,\"elapsed_ms\":%llu}\n", name,
+            (unsigned long long)(GetTickCount64() - encode_begin_ms));
         NV_ENC_PIC_PARAMS eos = {.version = NV_ENC_PIC_PARAMS_VER, .encodePicFlags = NV_ENC_PIC_FLAG_EOS};
         CHECK(api.nvEncEncodePicture(encoder, &eos) == NV_ENC_SUCCESS);
         CHECK(api.nvEncEncodePicture(encoder, &eos) == NV_ENC_ERR_INVALID_CALL);

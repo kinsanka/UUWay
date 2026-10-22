@@ -21,6 +21,7 @@
 #include "native_gpu_frame_channel.h"
 #include "native_cursor_metadata.h"
 #include "native_capture_status.h"
+#include "native_display_api.h"
 #include <sys/stat.h>
 #include <time.h>
 
@@ -43,7 +44,7 @@ struct probe {
     unsigned missing_source_header;
     unsigned process_callbacks, maximum_batch, superseded;
     struct uurb_cursor_snapshot *cursor;
-    unsigned cursor_updates;
+    unsigned cursor_updates, cursor_rejected;
     int cursor_mutter;
     int cursor_composite;
     unsigned cursor_frames;
@@ -148,6 +149,30 @@ static void record_delivery(struct probe *p, const struct spa_meta_header *heade
     p->frames++;
 }
 
+/* Cursor metadata is an independent optional channel. Its bounded parser
+ * commits nothing on failure. Retain the last valid cursor instead of tearing
+ * down a valid desktop stream when a compositor supplies an unsupported shape.
+ * Video plane/FD/fence checks below remain strict. */
+static int update_cursor(struct probe *p, const struct spa_meta *meta)
+{
+    int update = meta ? uurb_cursor_metadata(p->cursor, meta->data, meta->size, p->cursor_mutter) : 0;
+    if (update >= 0) return update;
+    if (++p->cursor_rejected <= 8) {
+        struct spa_meta_cursor cursor = {0};
+        struct spa_meta_bitmap bitmap = {0};
+        if (meta->data && meta->size >= sizeof(cursor)) {
+            memcpy(&cursor, meta->data, sizeof(cursor));
+            if (cursor.bitmap_offset >= sizeof(cursor) && cursor.bitmap_offset <= meta->size &&
+                sizeof(bitmap) <= meta->size - cursor.bitmap_offset)
+                memcpy(&bitmap, (const uint8_t *)meta->data + cursor.bitmap_offset, sizeof(bitmap));
+        }
+        fprintf(stderr, "UURB_CURSOR_METADATA_REJECTED {\"count\":%u,\"bytes\":%u,\"format\":%u,\"width\":%u,\"height\":%u,\"stride\":%d,\"hotspot_x\":%d,\"hotspot_y\":%d}\n",
+            p->cursor_rejected, meta->size, bitmap.format, bitmap.size.width, bitmap.size.height,
+            bitmap.stride, cursor.hotspot.x, cursor.hotspot.y);
+    }
+    return 0;
+}
+
 static void process_frame(struct probe *p, struct pw_buffer *frame)
 {
     struct spa_buffer *buffer = frame->buffer;
@@ -155,12 +180,7 @@ static void process_frame(struct probe *p, struct pw_buffer *frame)
      * deciding whether a GPU frame needs encoding. Never map desktop pixels. */
     if (p->cursor && buffer) {
         struct spa_meta *meta = spa_buffer_find_meta(buffer, SPA_META_Cursor);
-        int update = meta ? uurb_cursor_metadata(p->cursor, meta->data, meta->size, p->cursor_mutter) : 0;
-        if (update < 0) {
-            pw_stream_queue_buffer(p->stream, frame);
-            fail(p, "Invalid bounded cursor metadata");
-            return;
-        }
+        int update = update_cursor(p, meta);
         p->cursor_updates += update;
         if (uurb_cursor_only_buffer(buffer)) {
             /* Only opt-in GPU composition delivers a new video image for a
@@ -211,6 +231,13 @@ static void process_frame(struct probe *p, struct pw_buffer *frame)
     struct timespec now = {0};
     if (valid && !empty && clock_gettime(CLOCK_MONOTONIC, &now) < 0) valid = 0;
     uint64_t delivered_ns = (uint64_t)now.tv_sec * 1000000000ull + now.tv_nsec;
+    struct spa_meta_header receipt_header = {0};
+    const char *timestamp_source = getenv("UURB_CAPTURE_TIMESTAMP_SOURCE");
+    if (timestamp_source && !strcmp(timestamp_source, "monotonic-receipt")) {
+        if (header) receipt_header = *header;
+        receipt_header.pts = delivered_ns;
+        header = &receipt_header;
+    }
     if (valid && !empty && p->encoder) {
         if (!header || header->pts < 0 || (p->frames && (header->flags & SPA_META_HEADER_FLAG_DISCONT))) {
             fprintf(stderr, "Encoding requires continuous PipeWire source PTS; refusing a substituted clock\n");
@@ -255,9 +282,8 @@ static void supersede_frame(struct probe *p, struct pw_buffer *frame)
 {
     struct spa_buffer *buffer = frame->buffer;
     struct spa_meta *meta = p->cursor && buffer ? spa_buffer_find_meta(buffer, SPA_META_Cursor) : NULL;
-    int update = meta ? uurb_cursor_metadata(p->cursor, meta->data, meta->size, p->cursor_mutter) : 0;
+    int update = update_cursor(p, meta);
     pw_stream_queue_buffer(p->stream, frame);
-    if (update < 0) { fail(p, "Invalid bounded cursor metadata"); return; }
     p->cursor_updates += update;
     p->superseded++;
 }
@@ -350,7 +376,8 @@ static const struct spa_pod *offer(struct spa_pod_builder *builder,
             &SPA_RECTANGLE(1920,1080), &SPA_RECTANGLE(1,1), &SPA_RECTANGLE(8192,8192)), 0);
     spa_pod_builder_add(builder,
         SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
-            &SPA_FRACTION(60,1), &SPA_FRACTION(0,1), &SPA_FRACTION(120,1)), 0);
+            &SPA_FRACTION(max_fps ? max_fps : 60,1), &SPA_FRACTION(0,1),
+            &SPA_FRACTION(UURB_DISPLAY_MAX_REFRESH_HZ,1)), 0);
     if (max_fps) spa_pod_builder_add(builder, SPA_FORMAT_VIDEO_maxFramerate,
         SPA_POD_Fraction(&SPA_FRACTION(max_fps, 1)), 0);
     return spa_pod_builder_pop(builder, &object);
@@ -395,8 +422,8 @@ int main(int argc, char **argv)
     }
     unsigned long requested_max_fps = 0;
     const char *fps_setting = getenv("UURB_CAPTURE_MAX_FPS");
-    if (fps_setting && (!number(fps_setting, 120, &requested_max_fps) || !requested_max_fps)) {
-        fprintf(stderr, "UURB_CAPTURE_MAX_FPS must be an integer from 1 to 120\n"); return 2;
+    if (fps_setting && (!number(fps_setting, UURB_DISPLAY_MAX_REFRESH_HZ, &requested_max_fps) || !requested_max_fps)) {
+        fprintf(stderr, "UURB_CAPTURE_MAX_FPS must be an integer from 1 to %u\n", UURB_DISPLAY_MAX_REFRESH_HZ); return 2;
     }
     unsigned long fd, node;
     int import_check = argc == 4 && strcmp(argv[3], "--vulkan-import") == 0;
@@ -461,12 +488,16 @@ int main(int argc, char **argv)
     for (unsigned i = 0; i < count; i++) {
         VkPhysicalDeviceProperties properties;
         vkGetPhysicalDeviceProperties(devices[i], &properties);
+#ifdef UURB_VAAPI
+        if (properties.vendorID == 0x1002 || properties.vendorID == 0x8086) {
+#else
         if (properties.vendorID == 0x10de) {
-            if (selected) { fprintf(stderr, "Multiple NVIDIA GPUs: explicit selection required\n"); goto vulkan_done; }
+#endif
+            if (selected) { fprintf(stderr, "Multiple backend-compatible GPUs: explicit selection required\n"); goto vulkan_done; }
             selected = devices[i];
         }
     }
-    if (!selected) { fprintf(stderr, "No NVIDIA Vulkan physical device\n"); goto vulkan_done; }
+    if (!selected) { fprintf(stderr, "No backend-compatible Vulkan physical device\n"); goto vulkan_done; }
     uint8_t storage[16384];
     struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
     const struct spa_pod *params[4];
@@ -495,7 +526,9 @@ int main(int argc, char **argv)
     p.cursor_mutter = cursor_backend && !strcmp(cursor_backend, "mutter");
     if (cursor_fd) {
         unsigned long value;
-        if (!relay || !number(cursor_fd, INT_MAX, &value) || value == fd || value == output_fd || (int)value == status_fd ||
+        /* Import-only diagnostics may inspect the same private cursor channel
+         * without starting an encoder or exposing it to a remote consumer. */
+        if ((!relay && !import_check) || !number(cursor_fd, INT_MAX, &value) || value == fd || value == output_fd || (int)value == status_fd ||
             !(p.cursor = uurb_cursor_map((int)value))) {
             fprintf(stderr, "Cursor metadata requires an explicit private writable state FD\n");
             goto pw_done;
@@ -581,11 +614,14 @@ int main(int argc, char **argv)
                 p.source_timing.samples, p.source_timing.invalid, p.missing_source_header,
                 uurb_capture_timing_fps(&p.source_timing),
                 p.source_timing.gaps[0], p.source_timing.gaps[1], p.source_timing.gaps[2], p.source_timing.gaps[3],
-                p.process_callbacks, p.maximum_batch, p.superseded, (encode || relay) ? "pipewire-pts" : "none");
+                p.process_callbacks, p.maximum_batch, p.superseded,
+                (encode || relay) ? (getenv("UURB_CAPTURE_TIMESTAMP_SOURCE") &&
+                    !strcmp(getenv("UURB_CAPTURE_TIMESTAMP_SOURCE"), "monotonic-receipt") ?
+                    "monotonic-receipt" : "pipewire-pts") : "none");
         result = 0;
     } else fprintf(stderr, "Native capture did not deliver valid DMA-BUF frames\n");
 pw_done:
-    fprintf(stderr, "UURB_CURSOR_METADATA {\"updates\":%u}\n", p.cursor_updates);
+    fprintf(stderr, "UURB_CURSOR_METADATA {\"updates\":%u,\"rejected\":%u}\n", p.cursor_updates, p.cursor_rejected);
     if (p.cursor_composite)
         fprintf(stderr, "UURB_CURSOR_COMPOSITE {\"cursor_only_frames\":%u,\"desktop_frames\":%u}\n",
             p.cursor_frames, p.frames - p.cursor_frames);

@@ -31,12 +31,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import uuway_update  # noqa: E402
 import uuway_update_apply as update_checks  # noqa: E402
+import uuway_platform as platform  # noqa: E402
 
 PYTHON = '/usr/bin/python3'
-WINE_DIR = Path('/opt/wine-stable/bin')
+WINE_DIR = platform.wine_bin_dir()
 WINE_SERIES = 'wine-11.0'
 WINE_PIN = Path('/etc/apt/preferences.d/uuway-wine')
 SERVICES = ('uu-native-display', 'uu-native-text', 'uu-native-bridge')
+if platform.niri():
+    # niri has ScreenCast but no RemoteDesktop keyboard grant. Native input
+    # uses uinput/Fcitx; clipboard transport uses the existing Xwayland bridge.
+    SERVICES = ('uu-native-display', 'uu-native-bridge')
+if platform.umbriel():
+    SERVICES = ('uu-native-bridge',)
 GDM_CONFIGS = (Path('/etc/gdm3/custom.conf'), Path('/etc/gdm/custom.conf'))  # Debian/Ubuntu, Fedora/Arch
 AUTOLOGIN_KEYS = ('AutomaticLoginEnable', 'AutomaticLogin')
 TIMED_KEYS = ('TimedLoginEnable', 'TimedLogin', 'TimedLoginDelay')
@@ -54,9 +61,12 @@ UPDATE_RESUME_UNIT = 'uuway-update-resume'  # the one-shot that finishes an upda
 UPDATE_STALE_DAYS = 14
 SERVICE_MARKER = '# Managed by UURB native installer;'
 DESKTOP_MARKER = '# Managed by UUWay console installer'
+AMD_DESKTOP_MARKER = '# Managed by UUWay AMD\n'
 FCITX_MARKER = '# Managed by uuway setup'
 HELPERS = ('uu-clipboard-bridge', 'uu-clipboard-files.exe', 'uu-conpty.dll',
            'uu-terminal-bridge', 'uu-terminal-proxy.exe')
+GPU_BACKENDS = ('nvidia', 'amd')
+GPU_BACKEND_ENV = 'UURB_BACKEND'
 FCITX_CONF = '''{marker}
 [Addon]
 Name=UU Bridge native text input
@@ -126,6 +136,7 @@ class Context:
         self.config_dir = self.home / '.config/uurb'
         self.releases = self.home / '.local/share/uuway/releases'
         self.restart_bridge = False
+        self.restart_display = False
 
     @property
     def app_dir(self):
@@ -137,7 +148,9 @@ class Context:
 
     @property
     def restore_state(self):
-        return self.state_dir / 'portal-probe.json'
+        if platform.umbriel():
+            return self.config_dir / 'portal-restore-umbriel.json'
+        return self.state_dir / ('niri-capture.json' if platform.niri() else 'portal-probe.json')
 
     @property
     def text_token(self):
@@ -152,7 +165,7 @@ class Context:
         return self.home / '.config/systemd/user'
 
     def wine_env(self, **extra):
-        return dict(os.environ, WINEPREFIX=str(self.prefix), WINEDEBUG='-all', **extra)
+        return platform.intel_environment(dict(os.environ, WINEPREFIX=str(self.prefix), WINEDEBUG='-all', **extra))
 
     def run(self, argv, *, env=None, capture=False, check=True):
         """Show a command and run it; a dry run only shows it."""
@@ -260,25 +273,126 @@ def check_environment(ctx):
         for line in Path('/etc/os-release').read_text().splitlines():
             key, _, value = line.partition('=')
             release[key] = value.strip('"')
-    if release.get('ID') == 'ubuntu' and release.get('VERSION_ID') == '24.04':
+    if platform.fedora():
+        ok(release.get('PRETTY_NAME', 'Fedora'))
+    elif release.get('ID') == 'ubuntu' and release.get('VERSION_ID') == '24.04':
         ok('Ubuntu 24.04')
     else:
         warn(f'UUWay 只在 Ubuntu 24.04 上验证过（当前：{release.get("PRETTY_NAME", "未知")}），继续但不保证可用。')
     session = os.environ.get('XDG_SESSION_TYPE', '')
     desktop = os.environ.get('XDG_CURRENT_DESKTOP', '')
-    if session != 'wayland' or 'GNOME' not in desktop:
-        raise SetupError(f'请在 GNOME Wayland 会话里运行（当前会话：{session or "未知"} / {desktop or "未知"}）。')
-    ok('GNOME Wayland 会话')
-    gpus = ctx.probe(['nvidia-smi', '-L'])
-    if gpus.returncode != 0:
-        raise SetupError('没有找到可用的 NVIDIA 显卡驱动。UUWay 需要支持 NVENC 的 NVIDIA 显卡和官方驱动。')
-    ok('NVIDIA 显卡：' + gpus.stdout.splitlines()[0].split(' (UUID')[0])
+    if session != 'wayland' or ('GNOME' not in desktop and not platform.niri() and not platform.umbriel()):
+        raise SetupError(f'请在支持的 Wayland 桌面会话里运行（当前会话：{session or "未知"} / {desktop or "未知"}）。')
+    ok(f'{desktop} Wayland 会话')
+    backend = select_backend(ctx)
+    ctx.backend = backend
+    if backend == 'amd':
+        ok('AMD / Intel VA-API 硬件编码（兼容模式，画面经过内存中转）')
+    else:
+        gpus = ctx.probe(['nvidia-smi', '-L'])
+        ok('NVIDIA 显卡：' + (gpus.stdout.splitlines()[0].split(' (UUID')[0]
+                              if gpus.stdout.splitlines() else '驱动可用'))
+
+
+def amd_backend_enabled():
+    marker = ROOT / 'build/encoder-backend'
+    return marker.is_file() and marker.read_text().strip() == 'amd-vaapi'
+
+
+def backend_root(backend):
+    """Locate an immutable backend tree in a package or source checkout."""
+    for root in (ROOT / 'build/backends' / backend, DEB_ROOT / 'build/backends' / backend):
+        if root.is_dir():
+            return root
+    # Old source installs had one tree selected by build/encoder-backend.
+    if backend == 'amd' and amd_backend_enabled():
+        return ROOT / 'build'
+    if backend == 'nvidia' and not amd_backend_enabled() and (ROOT / 'build').is_dir():
+        return ROOT / 'build'
+    return None
+
+
+def backend_available(backend):
+    root = backend_root(backend)
+    if not root:
+        return False
+    if root == ROOT / 'build':
+        return root.is_dir()  # legacy marker layout; probe supplies the capability check
+    return (root / 'native-presenter').is_dir() and (root / 'dxvk-capture').is_dir()
+
+
+def amd_backend_probe(ctx, backend='amd'):
+    root = backend_root(backend) or ROOT / 'build'
+    binary = root / 'native-presenter/uu-vaapi-probe'
+    with tempfile.TemporaryDirectory(prefix='uuway-amd-check-') as directory:
+        return ctx.probe([binary, directory])
+
+
+def probe_backend(ctx, backend):
+    if not backend_available(backend):
+        return False, 'runtime is not installed'
+    if backend == 'nvidia':
+        result = ctx.probe(['nvidia-smi', '-L'])
+        stderr = getattr(result, 'stderr', '')
+        stderr = stderr if isinstance(stderr, str) else ''
+        return result.returncode == 0, stderr[-500:] or 'NVIDIA driver unavailable'
+    result = amd_backend_probe(ctx)
+    stderr = getattr(result, 'stderr', '')
+    stderr = stderr if isinstance(stderr, str) else ''
+    return result.returncode == 0, stderr[-500:] or 'VA-API H.264/HEVC probe failed'
+
+
+def configured_backend(ctx):
+    path = getattr(ctx, 'runtime_config', None)
+    if not isinstance(path, (str, os.PathLike, Path)):
+        return None
+    config = read_json(path)
+    value = config.get('backend') if isinstance(config, dict) else None
+    return value if value in GPU_BACKENDS else None
+
+
+def select_backend(ctx):
+    """Select NVIDIA first, then a verified AMD VA-API runtime.
+
+    UURB_BACKEND is an intentional diagnostic override.  A saved service choice
+    wins over changing hardware so a refresh cannot silently swap transports.
+    """
+    forced = os.environ.get(GPU_BACKEND_ENV, '').strip().lower()
+    if forced:
+        if forced not in GPU_BACKENDS:
+            raise SetupError(f'{GPU_BACKEND_ENV} 只能是 nvidia 或 amd。')
+        ok_backend, detail = probe_backend(ctx, forced)
+        if not ok_backend:
+            raise SetupError(f'强制选择 {forced} 后端失败：{detail}')
+        return forced
+    saved = configured_backend(ctx)
+    if saved:
+        ok_backend, detail = probe_backend(ctx, saved)
+        if not ok_backend:
+            raise SetupError(f'已保存的 {saved} 后端当前不可用：{detail}。如需切换请先删除配置或设置 {GPU_BACKEND_ENV}。')
+        return saved
+    for backend in GPU_BACKENDS:
+        ok_backend, _ = probe_backend(ctx, backend)
+        if ok_backend:
+            return backend
+    raise SetupError('没有检测到可用的 NVIDIA NVENC 或 AMD / Intel VA-API 后端；请安装对应显卡驱动后重试。')
+
+
+def backend_for_context(ctx):
+    backend = getattr(ctx, 'backend', None) or configured_backend(ctx)
+    if backend in GPU_BACKENDS:
+        return backend
+    # Keep old launcher/uninstall behavior and source checkouts working before
+    # setup has run; setup itself always calls select_backend first.
+    return 'amd' if amd_backend_enabled() else 'nvidia'
 
 
 # --------------------------------------------------------------------- step: wine
 
 def wine_done(ctx):
     version = wine_version(ctx)
+    if platform.fedora():
+        return platform.compatible_wine(version)
     return bool(version) and version.startswith(WINE_SERIES) and WINE_PIN.is_file()
 
 
@@ -289,6 +403,12 @@ def wine_pin_command(ctx):
 
 def wine_run(ctx):
     version = wine_version(ctx)
+    if platform.fedora():
+        if not platform.compatible_wine(version):
+            raise SetupError('Fedora 需要 Wine 11.0：sudo dnf install wine wine-devel；'
+                             '其他版本不兼容，请勿强行继续。')
+        ok(f'Fedora Wine：{version}')
+        return
     if version and version.startswith(WINE_SERIES):
         info('WineHQ 已是 11.0。还差把它固定在 11.0 系列，免得 apt upgrade 悄悄升到不兼容的版本。')
         if ctx.confirm(f'现在用 sudo 写入 {WINE_PIN}？'):
@@ -303,10 +423,12 @@ def wine_run(ctx):
     ctx.run(sudo + ['dpkg', '--add-architecture', 'i386'])
     if not list(Path('/etc/apt/sources.list.d').glob('winehq*')):
         ctx.run(sudo + ['install', '-d', '-m', '0755', '/etc/apt/keyrings'])
-        ctx.run(sudo + ['curl', '-fsSLo', '/etc/apt/keyrings/winehq-archive.key',
+        ctx.run(sudo + ['curl', '-fsSLo', '/etc/apt/keyrings/winehq-archive.asc',
                         'https://dl.winehq.org/wine-builds/winehq.key'])
         ctx.run(sudo + ['curl', '-fsSLo', '/etc/apt/sources.list.d/winehq-noble.sources',
                         'https://dl.winehq.org/wine-builds/ubuntu/dists/noble/winehq-noble.sources'])
+        ctx.run(sudo + ['sed', '-i', 's@winehq-archive.key@winehq-archive.asc@',
+                        '/etc/apt/sources.list.d/winehq-noble.sources'])
     else:
         info('已有 WineHQ 软件源配置，保持不变。')
     ctx.run(wine_pin_command(ctx))
@@ -383,6 +505,65 @@ def prefix_done(ctx):
         and not getattr(ctx.args, 'login', False)
 
 
+def open_uu(ctx):
+    """Open the login UI with the service bootstrap recent UU versions need."""
+    wine = WINE_DIR / 'wine'
+    executable = r'C:\Program Files\Netease\GameViewer\GameViewer.exe'
+    env = ctx.wine_env()
+    argv = [str(wine), executable]
+    if backend_for_context(ctx) == 'amd':
+        if unit_active(ctx, 'uu-native-bridge'):
+            if platform.umbriel():
+                result = ctx.run(['/usr/bin/umbriel', 'windows', '--json'], capture=True)
+                windows = json.loads(result.stdout)
+                matches = [item for item in windows if isinstance(item, dict) and
+                           str(item.get('app_id', '')).lower() == 'gameviewer.exe' and
+                           re.fullmatch(r'[A-Za-z0-9_-]{1,128}', str(item.get('id', '')))]
+                if matches:
+                    ctx.run(['/usr/bin/umbriel', 'msg', 'window-focus:' + str(matches[0]['id'])])
+                else:
+                    info('UU 后台正在运行，可从任务栏打开现有窗口。')
+                return
+            if platform.fedora() and platform.niri():
+                from native_niri_display import ipc_path
+                desktop_env = dict(os.environ, NIRI_SOCKET=str(ipc_path()))
+                result = ctx.run(['niri', 'msg', '-j', 'windows'], capture=True, env=desktop_env)
+                windows = json.loads(result.stdout)
+                matches = [item for item in windows if isinstance(item, dict) and
+                           str(item.get('app_id', '')).lower() == 'gameviewer.exe' and
+                           type(item.get('id')) is int]
+                if matches:
+                    ctx.run(['niri', 'msg', 'action', 'focus-window', '--id', str(matches[0]['id'])], env=desktop_env)
+                else:
+                    info('UU 已在运行，请从 Fedora 任务栏打开现有窗口。')
+                return
+            raise SetupError('UU 后台运行在独立显示中，无法在桌面打开它的窗口。需要重新登录时请运行 uuway setup --login。')
+        stage = ctx.state_dir / 'login-support'
+        if not ctx.dry_run:
+            stage.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for source, target in [('uu-native-bootstrap.exe', 'bootstrap.exe'),
+                                   ('uu-native-winlogon.exe', 'winlogon.exe')]:
+                shutil.copy2((backend_root('amd') or ROOT / 'build') / 'native-presenter' / source,
+                             stage / target)
+        argv = [str(wine), str(stage / 'bootstrap.exe'), '--login', executable,
+                'UURB-NATIVE-LOGIN-AMD']
+        env['UURB_NATIVE_BOOTSTRAP'] = '1'
+    if ctx.dry_run:
+        ctx.run(argv, env=env)
+        return
+    ctx.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (ctx.state_dir / 'login.log').open('a') as log:
+        return subprocess.Popen(argv, env=env, stdout=log, stderr=log,
+                                start_new_session=True)
+
+
+def command_open(args):
+    ctx = Context(args)
+    if not ctx.server_exe.is_file():
+        raise SetupError('UU 尚未安装，请先运行 uuway-amd setup。')
+    open_uu(ctx)
+
+
 def prefix_run(ctx):
     if unit_active(ctx, 'uu-native-bridge'):
         info('先停止正在运行的 UUWay 服务（之后会重新启动）。')
@@ -407,6 +588,9 @@ def prefix_run(ctx):
         if not ctx.dry_run:
             ctx.prefix.chmod(0o700)  # the service refuses a prefix other users can enter
         ctx.run([wine, installer, '/S'], env=ctx.wine_env())
+        # Recent installers leave GameViewerService running after /S exits.
+        # Stop only this owned prefix, then open the interactive login below.
+        ctx.run([wineserver, '-k'], env=ctx.wine_env(), check=False)
         ctx.run([wineserver, '-w'], env=ctx.wine_env())
         if not ctx.dry_run and not ctx.server_exe.is_file():
             raise SetupError('安装包运行结束，但没有找到 GameViewerServer.exe。')
@@ -414,10 +598,7 @@ def prefix_run(ctx):
         ctx.args.login = True
     if getattr(ctx.args, 'login', False) or not signed_in(ctx):
         info('接下来会打开 UU 窗口：请登录你的 UU 账号，登录成功后从托盘图标完全退出 UU。')
-        if not ctx.dry_run:
-            subprocess.Popen([str(wine), r'C:\Program Files\Netease\GameViewer\GameViewer.exe'],
-                             env=ctx.wine_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True)
+        open_uu(ctx)
         ctx.wait_for_user('在 UU 里登录并完全退出')
         if not ctx.dry_run and not signed_in(ctx):
             warn('没有检测到登录信息；如果连接不上，请运行 uuway setup --login 重新登录。')
@@ -425,6 +606,7 @@ def prefix_run(ctx):
     # UU's terminal starts PowerShell; Wine must load UUWay's stand-in, not its placeholder.
     ctx.run([wine, 'reg', 'add', r'HKCU\Software\Wine\DllOverrides', '/v', 'powershell.exe',
              '/t', 'REG_SZ', '/d', 'native', '/f'], env=ctx.wine_env())
+    ctx.run([wineserver, '-k'], env=ctx.wine_env(), check=False)
     ctx.run([wineserver, '-w'], env=ctx.wine_env())
 
 
@@ -529,14 +711,27 @@ def portal_done(ctx):
 def portal_run(ctx):
     if not ctx.dry_run:
         ctx.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if platform.niri():
+        from native_niri_display import topology
+        connector = topology()['connectors'][0]
+        info(f'检查 niri 原生屏幕共享：{connector}')
+        root = backend_root(backend_for_context(ctx)) or ROOT / 'build'
+        ctx.run([PYTHON, ROOT / 'scripts/probe-niri-capture.py', '--connector', connector,
+                 '--capture-binary', root / 'native-presenter/uu-pipewire-native-probe',
+                 '--state', ctx.restore_state], env=ctx.wine_env())
+        ok('niri 原生屏幕共享检查通过')
+        return
     backup = None
     if getattr(ctx.args, 'regrant_screen', False) and ctx.restore_state.exists() and not ctx.dry_run:
         backup = ctx.restore_state.with_name(ctx.restore_state.name + f'.before-{int(time.time())}')
         ctx.restore_state.rename(backup)
-    info('接下来会弹出屏幕共享对话框：请选择要串流给手机的显示器，并勾选「记住」。')
+    info('接下来会检查屏幕共享：请选择一块显示器，并勾选「记住」。')
+    info('请选择要远程控制的整个屏幕。Umbriel 目前保留当前分辨率，不从远端改变桌面模式。'
+         if platform.umbriel() else '运行后，UU 可切换本次 GNOME 会话的所有活动显示器，包括之后创建的超级屏。')
     try:
         ctx.run([PYTHON, ROOT / 'scripts/probe-wayland-portal.py', '--capture-check',
-                 '--restore-state', ctx.restore_state])
+                 '--restore-state', ctx.restore_state,
+                 *(['--cursor-mode', 'metadata', '--cursor-backend', 'spa'] if platform.umbriel() else [])])
         if not ctx.dry_run and not (ctx.restore_state.is_file() and ctx.restore_state.stat().st_size):
             raise SetupError('没有保存屏幕共享授权，请重新运行并勾选「记住」。')
     except (SetupError, OSError):
@@ -552,8 +747,9 @@ def package_bundle(ctx):
     if not ctx.dry_run:
         ctx.releases.parent.mkdir(parents=True, exist_ok=True)
         ctx.releases.mkdir(mode=0o700, exist_ok=True)
+    backend = backend_for_context(ctx)
     result = ctx.run([PYTHON, ROOT / 'scripts/package-uu-native-runtime.py', 'package', '--with-input',
-                      ctx.releases], capture=True)
+                      '--backend', backend, ctx.releases], capture=True)
     if ctx.dry_run:
         return ctx.releases / '<sha256>'
     try:
@@ -589,7 +785,7 @@ def runtime_done(ctx):
 
 BACKUP_CONFIG = ('native-runtime.json', 'text-backend.json', 'input-settings.json')
 RESTORE_NOTE = """To go back to the previous installation, from this directory:
-  cp -a home/. ~/
+  cp -a --remove-destination --no-preserve=mode home/. ~/
   systemctl --user daemon-reload && systemctl --user restart uu-native-bridge
 Files are stored under home/ with the path they have relative to your home directory.
 The old runtime directories are never deleted by uuway.
@@ -600,6 +796,10 @@ def backup_candidates(ctx):
     """Every file a setup run can replace or remove in an existing installation."""
     app_bin = ctx.app_dir / 'bin'
     candidates = [ctx.unit_dir / (name + '.service') for name in SERVICES]
+    if platform.umbriel():
+        for name in ('uu-native-display', 'uu-native-text', 'uu-wayland-clipboard'):
+            candidates.append(ctx.unit_dir / (name + '.service'))
+        candidates.extend(ctx.unit_dir.glob('uu-native-*.service.d/*.conf'))
     candidates += [ctx.config_dir / name for name in BACKUP_CONFIG]
     if ctx.config_dir.is_dir():  # a rollback has to find the old installer's whole configuration as it was
         candidates += sorted(path for path in ctx.config_dir.rglob('*') if path not in candidates)
@@ -629,7 +829,9 @@ def ensure_backup(ctx):
         return None
     ctx.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     # mkdtemp keeps two runs in the same second apart and creates the directory 0700.
-    target = Path(tempfile.mkdtemp(prefix=time.strftime('backup-%Y%m%d-%H%M%S-'), dir=ctx.state_dir))
+    backup_root = ctx.home / 'backup/UUWay/安装升级'
+    backup_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = Path(tempfile.mkdtemp(prefix=time.strftime('backup-%Y%m%d-%H%M%S-'), dir=backup_root))
     for path in present:
         copy = target / 'home' / path.relative_to(ctx.home)
         copy.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -641,18 +843,45 @@ def ensure_backup(ctx):
 
 def runtime_run(ctx):
     ensure_backup(ctx)
+    previous = read_json(ctx.runtime_config) or {}
+    if not getattr(ctx, 'backend', None):
+        ctx.backend = backend_for_context(ctx)
+    bundle = package_bundle(ctx)
+    new_manifest = read_json(bundle / 'manifest.json') or {}
+    if (new_manifest.get('contract', {}).get('virtual_display_emulation') is True and
+            str(bundle) != previous.get('bundle')):
+        # Reload the independent daemon on every runtime upgrade, including
+        # fixes within the same virtual-display ABI. Text keeps running.
+        ctx.restart_display = True
     if unit_active(ctx, 'uu-native-bridge'):
         info('先停止 UUWay 桥接服务，写好配置后再启动。')
         ctx.run(['systemctl', '--user', 'stop', 'uu-native-bridge.service'])
-    bundle = package_bundle(ctx)
+    if platform.umbriel():
+        # These were separate workers in the Fedora migration. Keep their unit
+        # files/backups for rollback, but run only the unified service now.
+        for name in ('uu-native-display', 'uu-wayland-clipboard'):
+            unit = ctx.unit_dir / (name + '.service')
+            if unit.is_file():
+                content = unit.read_text()
+                if content.startswith(SERVICE_MARKER) or 'uu-wayland-clipboard.py' in content:
+                    ctx.run(['systemctl', '--user', 'disable', '--now', name + '.service'], check=False)
+        old_override = ctx.unit_dir / 'uu-native-bridge.service.d/70-umbriel.conf'
+        if old_override.is_file() and 'uuway-umbriel/launch-bridge.py' in old_override.read_text():
+            if not ctx.dry_run:
+                old_override.unlink()  # Saved by ensure_backup before any change.
     ok(f'运行时：{bundle}')
     command = [PYTHON, ROOT / 'scripts/install-uu-native-service.py', '--bundle', bundle,
                '--prefix', ctx.prefix, '--restore-state', ctx.restore_state,
-               '--state-parent', ctx.state_dir, '--text-socket', ctx.state_dir / 'text.sock']
+               '--state-parent', ctx.state_dir, '--text-socket', ctx.state_dir / 'text.sock',
+               '--backend', ctx.backend]
     if not ctx.runtime_config.exists():
         # A re-run must keep what the console saved, so these only go in on a fresh install.
-        command += ['--cursor-mode', 'metadata', '--preserve-display-session']
+        command += ['--cursor-mode', 'embedded' if platform.niri() else 'metadata', '--preserve-display-session']
     ctx.run(command)
+    if platform.umbriel():
+        codec_policy = ctx.config_dir / 'video-codec.json'
+        if not codec_policy.exists() and not ctx.dry_run:
+            write_atomic(codec_policy, b'{"schema":1,"codec":"auto"}\n', 0o600)
     # Wine's Linux path view is applied while the bridge is stopped, and the short-lived
     # wineserver the registry update starts is reaped before the bridge's Wine starts.
     ctx.run([PYTHON, ROOT / 'scripts/configure-uu-wine-mappings.py', '--prefix', ctx.prefix,
@@ -676,7 +905,10 @@ def runtime_run(ctx):
 # --------------------------------------------------------------------- step: start
 
 def start_done(ctx):
-    return not ctx.restart_bridge and all(unit_active(ctx, name) for name in SERVICES)
+    return (not ctx.restart_bridge and not ctx.restart_display and
+            not getattr(ctx.args, 'restart_display', False) and
+            not getattr(ctx.args, 'restart_services', False) and
+            all(unit_active(ctx, name) for name in SERVICES))
 
 
 def restart_services_confirmed(ctx):
@@ -691,25 +923,51 @@ def restart_services_confirmed(ctx):
 
 
 def start_run(ctx):
-    ctx.run(['systemctl', '--user', 'enable', '--now', *(name + '.service' for name in SERVICES)])
+    if platform.umbriel():
+        ctx.run(['systemctl', '--user', 'enable', 'uu-native-bridge.service'])
+        ctx.run(['systemctl', '--user', 'restart' if ctx.restart_bridge else 'start', 'uu-native-bridge.service'])
+        if not ctx.dry_run:
+            time.sleep(2)
+            if not unit_active(ctx, 'uu-native-bridge'):
+                raise SetupError('UUWay 启动失败，请查看 journalctl --user -u uuway.service')
+        ctx.restart_bridge = ctx.restart_display = False
+        return
+    ctx.restart_bridge |= bool(getattr(ctx.args, 'restart_services', False))
+    restart_display = ctx.restart_display or getattr(ctx.args, 'restart_display', False)
+    if restart_display:
+        if unit_active(ctx, 'uu-native-bridge'):
+            ctx.run(['systemctl', '--user', 'stop', 'uu-native-bridge.service'])
+        info('加载多屏与超级屏显示服务；现有超级屏会移除。')
+        ctx.run(['systemctl', '--user', 'restart', 'uu-native-display.service'])
+        ctx.restart_bridge = True
+    # Enabling with --now would boot UU here, then immediately kill it in
+    # the restart below. Its Windows services can still be initializing.
+    ctx.run(['systemctl', '--user', 'enable', *(name + '.service' for name in SERVICES)])
     if ctx.restart_bridge:
         if getattr(ctx.args, 'restart_services', False) and restart_services_confirmed(ctx):
             ctx.run(['systemctl', '--user', 'restart', 'uu-native-display.service', 'uu-native-text.service'])
         elif not ctx.dry_run:
-            info('文字与显示服务保持运行，不会被隐式重启（会丢失剪贴板所有权）；'
+            info('文字服务保持运行，保留剪贴板所有权；'
                  '空闲时可用 uuway refresh --restart-services 一并重启。')
         ctx.run(['systemctl', '--user', 'restart', 'uu-native-bridge.service'])
+    else:
+        ctx.run(['systemctl', '--user', 'start', *(name + '.service' for name in SERVICES)])
     if not ctx.dry_run:
         time.sleep(5)
         if not unit_active(ctx, 'uu-native-bridge'):
             raise SetupError('uu-native-bridge 没有启动，请查看：journalctl --user -u uu-native-bridge -e')
     ctx.restart_bridge = False
+    ctx.restart_display = False
     ok('服务已启动')
 
 
 # --------------------------------------------------------------------- step: text consent
 
 def consent_done(ctx):
+    if platform.umbriel():
+        return True  # Native uinput and data-control; no GNOME remote keyboard grant.
+    if platform.niri():
+        return fcitx_conf_path(ctx).is_file()
     try:
         return ctx.text_token.stat().st_size > 0
     except OSError:
@@ -717,6 +975,12 @@ def consent_done(ctx):
 
 
 def consent_run(ctx):
+    if platform.umbriel():
+        info('Umbriel 使用原生输入和双向文本剪贴板，无需额外 GNOME 授权。')
+        return
+    if platform.niri():
+        info('niri 文字输入使用 Fcitx5；不申请不受支持的 GNOME 远程键盘授权。')
+        return
     info('文字服务还会再弹出一个授权对话框（远程输入与剪贴板），请点「允许」；约 2 分钟内有效。')
     if ctx.dry_run:
         return
@@ -731,7 +995,53 @@ def consent_run(ctx):
 
 # --------------------------------------------------------------------- step: launchers
 
+def amd_launcher_text():
+    return (AMD_DESKTOP_MARKER + '[Desktop Entry]\nType=Application\nName=UU远程\n'
+            f'Exec=/bin/bash "{ROOT / "scripts/uuway-amd.sh"}" open\n'
+            'Icon=024B_GameViewer.0\nStartupWMClass=gameviewer.exe\nTerminal=false\n')
+
+
+def amd_launcher_targets(ctx):
+    yield ctx.home / '.local/share/applications/uuway-amd.desktop'
+    for path in (ctx.home / 'Desktop/UU远程.desktop',
+                 ctx.home / '.local/share/applications/wine/Programs/UU远程.desktop'):
+        if not path.is_file() or path.is_symlink():
+            continue
+        text = path.read_text()
+        if text.startswith(AMD_DESKTOP_MARKER) or (
+                'StartupWMClass=gameviewer.exe\n' in text and
+                f'Path={ctx.app_dir}\n' in text):
+            yield path
+
+
+def remove_amd_launchers(ctx):
+    # Also works when uninstall is invoked through the installed NVIDIA CLI.
+    # Only restore/remove our marked regular files; never follow a backup link.
+    paths = (ctx.home / '.local/share/applications/uuway-amd.desktop',
+             ctx.home / 'Desktop/UU远程.desktop',
+             ctx.home / '.local/share/applications/wine/Programs/UU远程.desktop')
+    for path in paths:
+        try:
+            if path.is_symlink() or not path.is_file() or not path.read_text().startswith(AMD_DESKTOP_MARKER):
+                continue
+            backup = path.with_suffix('.desktop.before-amd')
+            if backup.is_symlink() or (backup.exists() and not backup.is_file()):
+                warn(f'备份不是普通文件，保留入口：{path}')
+                continue
+            info(f'恢复快捷方式 {path}' if backup.is_file() else f'删除 {path}')
+            if not ctx.dry_run:
+                if backup.is_file():
+                    os.replace(backup, path)
+                else:
+                    path.unlink()
+        except OSError as error:
+            warn(f'{path}：{error}')
+
+
 def launchers_done(ctx):
+    if backend_for_context(ctx) == 'amd':
+        return all(path.is_file() and path.read_text() == amd_launcher_text()
+                   for path in amd_launcher_targets(ctx))
     desktop = ctx.home / '.local/share/applications/uuway.desktop'
     try:
         return not desktop.read_text().startswith(DESKTOP_MARKER)
@@ -740,6 +1050,16 @@ def launchers_done(ctx):
 
 
 def launchers_run(ctx):
+    if backend_for_context(ctx) == 'amd':
+        for path in amd_launcher_targets(ctx):
+            if not ctx.dry_run:
+                if path.is_file() and not path.read_text().startswith(AMD_DESKTOP_MARKER):
+                    backup = path.with_suffix('.desktop.before-amd')
+                    if not backup.exists():
+                        shutil.copy2(path, backup)
+                write_atomic(path, amd_launcher_text().encode(), 0o755)
+        ok('UU 桌面与菜单入口已配置为 AMD 版启动器')
+        return
     desktop = ctx.home / '.local/share/applications/uuway.desktop'
     with contextlib.suppress(OSError):
         if desktop.read_text().startswith(DESKTOP_MARKER):
@@ -981,7 +1301,7 @@ def command_autologin(args):
 
 
 STEPS = (
-    ('wine', 'WineHQ stable 11.0', wine_done, wine_run),
+    ('wine', 'Wine 11.0', wine_done, wine_run),
     ('udev', '键鼠注入权限（uinput）', udev_done, udev_run),
     ('prefix', '安装并登录 UU 远程', prefix_done, prefix_run),
     ('helpers', '安装辅助程序', helpers_done, helpers_run),
@@ -1057,7 +1377,12 @@ def command_refresh(args):
     if unit_active(ctx, 'uu-native-bridge') and not ctx.confirm('刷新会重启桥接服务，正在进行的远程会话会断开。继续吗？'):
         return 1
     with setup_lock(ctx):
-        run_steps(ctx, set(REFRESH_STEPS), set())
+        steps = set(REFRESH_STEPS)
+        if ROOT.resolve() == DEB_ROOT:
+            # Remove a source install's immutable per-user menu entry, which
+            # otherwise shadows the console delivered by each package update.
+            steps.add('launchers')
+        run_steps(ctx, steps, set())
     return 0
 
 
@@ -1072,27 +1397,39 @@ def command_doctor(args):
 
     session = os.environ.get('XDG_SESSION_TYPE', '')
     desktop = os.environ.get('XDG_CURRENT_DESKTOP', '')
-    check('ok' if session == 'wayland' and 'GNOME' in desktop else 'fail', 'GNOME Wayland 会话',
+    check('ok' if session == 'wayland' and ('GNOME' in desktop or platform.niri() or platform.umbriel()) else 'fail', 'Wayland 会话',
           f'{session or "?"} / {desktop or "?"}')
-    gpus = ctx.probe(['nvidia-smi', '-L'])
-    check('ok' if gpus.returncode == 0 else 'fail', 'NVIDIA 驱动',
-          gpus.stdout.splitlines()[0] if gpus.returncode == 0 else '没有找到可用的 NVIDIA 驱动')
-    for library in ('libcuda.so.1', 'libnvidia-encode.so.1'):
-        try:
-            ctypes.CDLL(library)
-            check('ok', library)
-        except OSError:
-            check('fail', library, '驱动没有提供它（NVENC 需要）')
-    with contextlib.suppress(ImportError):
-        import native_runtime_state
-        mismatch = native_runtime_state.nvidia_driver_mismatch()
-        if mismatch:
-            check('fail', 'NVIDIA 内核模块与用户态库版本不一致',
-                  f'{mismatch["kernel_module"]} ≠ {mismatch["userspace"]}，请重启')
+    try:
+        backend = select_backend(ctx)
+    except SetupError as error:
+        backend = configured_backend(ctx) or ('amd' if amd_backend_enabled() else 'nvidia')
+        check('fail', 'GPU 后端自动选择', str(error))
+    else:
+        check('ok', 'GPU 后端自动选择', 'AMD / Intel VA-API' if backend == 'amd' else 'NVIDIA NVENC')
+    if backend == 'amd':
+        result = amd_backend_probe(ctx)
+        check('ok' if result.returncode == 0 else 'fail', 'AMD / Intel VA-API 硬件编码',
+              'H.264/HEVC 编码验证通过；内存中转模式' if result.returncode == 0 else result.stderr[-500:])
+    else:
+        gpus = ctx.probe(['nvidia-smi', '-L'])
+        check('ok' if gpus.returncode == 0 else 'fail', 'NVIDIA 驱动',
+              gpus.stdout.splitlines()[0] if gpus.returncode == 0 else '没有找到可用的 NVIDIA 驱动')
+        for library in ('libcuda.so.1', 'libnvidia-encode.so.1'):
+            try:
+                ctypes.CDLL(library)
+                check('ok', library)
+            except OSError:
+                check('fail', library, '驱动没有提供它（NVENC 需要）')
+        with contextlib.suppress(ImportError):
+            import native_runtime_state
+            mismatch = native_runtime_state.nvidia_driver_mismatch()
+            if mismatch:
+                check('fail', 'NVIDIA 内核模块与用户态库版本不一致',
+                      f'{mismatch["kernel_module"]} ≠ {mismatch["userspace"]}，请重启')
     version = wine_version(ctx)
-    check('ok' if version and version.startswith(WINE_SERIES) else 'fail', 'WineHQ stable 11.0',
+    check('ok' if version and platform.compatible_wine(version) else 'fail', 'Wine 11.0',
           version or '没有找到 /opt/wine-stable/bin/wine（运行 uuway setup）')
-    if version and version.startswith(WINE_SERIES):
+    if version and version.startswith(WINE_SERIES) and not platform.fedora():
         check('ok' if WINE_PIN.is_file() else 'warn', 'WineHQ 已固定在 11.0 系列',
               str(WINE_PIN) if WINE_PIN.is_file() else '升级 WineHQ 可能让 UUWay 无法采集画面；运行 uuway setup --only wine')
     check('ok' if uinput_usable() else 'fail', '/dev/uinput 可写', '' if uinput_usable()
@@ -1108,7 +1445,8 @@ def command_doctor(args):
     check('ok' if helpers_done(ctx) else 'warn', '辅助程序与终端代理已同步')
     token = ctx.restore_state
     check('ok' if token.is_file() and token.stat().st_size else 'warn', '屏幕共享授权', str(token))
-    check('ok' if consent_done(ctx) else 'warn', '文字服务授权', str(ctx.text_token))
+    check('ok' if consent_done(ctx) else 'warn', '中文输入通道' if platform.niri() else '文字服务授权',
+          str(fcitx_conf_path(ctx) if platform.niri() else ctx.text_token))
     config = read_json(ctx.runtime_config)
     check('ok' if config else 'fail', '服务配置', str(ctx.runtime_config))
     if config:
@@ -1209,6 +1547,12 @@ def update_busy(ctx):
 def update_check(ctx, args):
     installed = deb_version(ctx)
     latest = latest_known(ctx)
+    if getattr(args, 'json', False):
+        print(json.dumps(dict(installed=installed, latest=latest.version, tag=latest.tag, url=latest.url,
+                              published=latest.published, checked_at=int(time.time()),
+                              available=bool(installed and is_newer(ctx, latest.version, installed)),
+                              installable=bool(installed and not installed.startswith('0.0.0~')))))
+        return 0
     if installed is None:
         info(f'最新正式版：{latest.version}（{latest.url}）')
         warn('这不是用安装包装的 UUWay（源码目录或开发构建），没法比较版本，也不能用 uuway update 安装。')
@@ -1258,6 +1602,18 @@ def result_succeeded(result):
 
 
 def update_status(ctx, args):
+    if getattr(args, 'json', False):
+        installed = deb_version(ctx)
+        result = read_json(UPDATE_STATE / 'last-result.json')
+        result = result if isinstance(result, dict) else None
+        target = result.get('rollback_to') if result else None
+        previous = target.get('deb') if isinstance(target, dict) else None
+        print(json.dumps(dict(installed=installed, installable=bool(installed and not installed.startswith('0.0.0~')),
+                              busy=update_busy(ctx), result=result, progress=read_progress(20),
+                              rollback_available=bool(installed and isinstance(previous, str) and
+                                                      Path(previous).is_absolute() and Path(previous).is_file())),
+                         ensure_ascii=False))
+        return 0
     if update_busy(ctx):
         warn('更新正在进行中，最近的进度：')
         for line in read_progress(12):
@@ -1275,6 +1631,8 @@ def update_recovery_layer(ctx, args):
     timed = timed_state(ctx)
     if timed and timed[0] and timed[1] == getpass.getuser():
         return
+    if getattr(args, 'allow_no_recovery', False):
+        return  # Explicit GUI/CLI consent; never enables autologin implicitly.
     warn('这台机器在桌面崩溃或注销后不会自动重新登录：万一更新让桌面崩溃，没有人在本机登录，UU 就一直离线。')
     info('先开启：uuway autologin on')
     if ctx.assume_yes or not sys.stdin.isatty():
@@ -1464,6 +1822,8 @@ def update_rollback(ctx, args):
 
 
 def command_update(args):
+    if platform.fedora():
+        raise SetupError('Fedora 版请使用 sudo dnf upgrade ./uuway-*.rpm；上游自动更新目前只提供 Ubuntu .deb。')
     ctx = Context(args)
     refuse_root()
     handler = dict(check=update_check, install=update_install, status=update_status, rollback=update_rollback)
@@ -1515,6 +1875,7 @@ def command_uninstall(args):
                 warn(f'不是 UUWay 管理的文件，已保留：{path}')
         except OSError as error:
             warn(f'{path}：{error}')
+    remove_amd_launchers(ctx)
     ctx.run(['systemctl', '--user', 'daemon-reload'], check=False)
     if args.purge:
         for directory in (ctx.config_dir, ctx.state_dir, ctx.releases.parent):
@@ -1525,11 +1886,16 @@ def command_uninstall(args):
         print('\n开机自动登录是 UUWay 开启的，卸载没有改动它；它的记录已随 --purge 删除，要关闭请编辑 GDM 配置。'
               if args.purge else '\n开机自动登录是 UUWay 开启的，卸载没有改动它；要关闭：uuway autologin off')
     print('\nWine prefix（含 UU 登录信息）没有动：' + str(ctx.prefix)
-          + '\n不再需要时可手动删除；要卸载程序本身：sudo apt remove uuway')
+          + ('\n要卸载程序本身：sudo dnf remove uuway' if platform.fedora()
+             else '\n不再需要时可手动删除；要卸载程序本身：sudo apt remove uuway'))
     return 0
 
 
 def installed_version():
+    if platform.fedora():
+        result = subprocess.run(['rpm', '-q', '--qf', '%{VERSION}-%{RELEASE}', 'uuway'],
+                                capture_output=True, text=True, check=False)
+        return result.stdout if result.returncode == 0 else 'Fedora 源码目录'
     result = subprocess.run(['dpkg-query', '-W', '-f=${Version}', 'uuway'], capture_output=True, text=True,
                             check=False) if shutil.which('dpkg-query') else None
     return result.stdout if result and result.returncode == 0 and result.stdout else '源码目录'
@@ -1554,12 +1920,18 @@ def build_parser():
     setup.add_argument('--login', action='store_true', help='即使已登录也重新打开 UU 登录一次')
     setup.add_argument('--regrant-screen', action='store_true', help='重新授权屏幕共享')
     setup.add_argument('--restart-services', action='store_true', help='同时重启文字与显示服务')
+    setup.add_argument('--restart-display', action='store_true', help='重启显示服务以加载多屏与超级屏更新（移除现有超级屏）')
     setup.set_defaults(handler=command_setup)
+
+    launch = commands.add_parser('open', help='打开 UU 窗口（含新版 UU 登录所需的服务引导）')
+    launch.add_argument('--prefix', type=Path)
+    launch.set_defaults(handler=command_open)
 
     refresh = commands.add_parser('refresh', help='升级软件包后，重打运行时并重启桥接服务')
     common(refresh)
     refresh.add_argument('--prefix', type=Path)
     refresh.add_argument('--restart-services', action='store_true', help='同时重启文字与显示服务')
+    refresh.add_argument('--restart-display', action='store_true', help='重启显示服务并移除现有超级屏，保留文字服务')
     refresh.set_defaults(handler=command_refresh)
 
     doctor = commands.add_parser('doctor', help='检查环境与安装状态')
@@ -1579,6 +1951,9 @@ def build_parser():
     update.add_argument('--prefix', type=Path)
     update.add_argument('--source', type=Path, help=argparse.SUPPRESS)  # rehearsal: a release staged by hand
     update.add_argument('--tag', help=argparse.SUPPRESS)
+    update.add_argument('--json', action='store_true', help='以 JSON 返回检查结果或更新状态')
+    update.add_argument('--allow-no-recovery', action='store_true',
+                        help='明确允许未配置桌面自动恢复时安装更新；不更改自动登录设置')
     update.add_argument('--reboot-if-stuck', action='store_true',
                         help='回滚后桌面仍然回不来时，自动重启这台机器一次（会中断正在跑的任务）')
     update.set_defaults(handler=command_update)

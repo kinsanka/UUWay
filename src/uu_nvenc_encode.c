@@ -29,11 +29,13 @@ static void lifecycle(enum lifecycle_event event, const NV_ENC_INITIALIZE_PARAMS
     if (reports[event]++ >= 64) { reports[event] = 64; return; }
     unsigned codec = p ? !memcmp(&p->encodeGUID, &NV_ENC_CODEC_H264_GUID, sizeof(GUID)) ? 1 :
         !memcmp(&p->encodeGUID, &NV_ENC_CODEC_HEVC_GUID, sizeof(GUID)) ? 2 : 0 : 0;
+    const NV_ENC_RC_PARAMS *rc = p && p->encodeConfig ? &p->encodeConfig->rcParams : NULL;
     fprintf(stderr, "UURB_NATIVE_ENCODER {\"event\":\"%s\",\"peer_pid\":%u,\"tick_ms\":%llu,\"status\":%u,"
-        "\"width\":%u,\"height\":%u,\"rate_num\":%u,\"rate_den\":%u,\"codec\":%u}\n",
+        "\"width\":%u,\"height\":%u,\"rate_num\":%u,\"rate_den\":%u,\"codec\":%u,\"bitrate\":%u,\"vbv\":%u,\"aq\":%u}\n",
         names[event], (unsigned)getpid(), (unsigned long long)GetTickCount64(), (unsigned)status,
         p ? p->encodeWidth : 0, p ? p->encodeHeight : 0,
-        p ? p->frameRateNum : 0, p ? p->frameRateDen : 0, codec);
+        p ? p->frameRateNum : 0, p ? p->frameRateDen : 0, codec,
+        rc ? rc->averageBitRate : 0, rc ? rc->vbvBufferSize : 0, rc ? rc->enableAQ : 0);
 }
 struct input_resource {
     void *token, *mapped;

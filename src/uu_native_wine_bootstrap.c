@@ -8,7 +8,7 @@
 #include <tlhelp32.h>
 
 struct setting { HKEY hive; const WCHAR *key, *name, *value; };
-static struct setting settings[20];
+static struct setting settings[24];
 static unsigned count;
 static const WCHAR env_key[] = L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
 static const WCHAR *override_keys[] = {
@@ -81,14 +81,14 @@ static DWORD launch(const WCHAR *executable, PROCESS_INFORMATION *child)
     return CreateProcessW(executable, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &startup, child) ? 0 : GetLastError();
 }
 
-static DWORD server_pid(void)
+static DWORD named_process_pid(const WCHAR *name)
 {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) return 0;
     PROCESSENTRY32W entry = {.dwSize = sizeof(entry)};
     DWORD pid = 0;
     if (Process32FirstW(snapshot, &entry)) do {
-        if (!_wcsicmp(entry.szExeFile, L"GameViewerServer.exe")) {
+        if (!_wcsicmp(entry.szExeFile, name)) {
             if (pid) { pid = 0; break; } /* ambiguous target is not safe */
             pid = entry.th32ProcessID;
         }
@@ -96,6 +96,9 @@ static DWORD server_pid(void)
     CloseHandle(snapshot);
     return pid;
 }
+
+static DWORD server_pid(void) { return named_process_pid(L"GameViewerServer.exe"); }
+static DWORD service_pid(void) { return named_process_pid(L"GameViewerService.exe"); }
 
 static DWORD attach_input(const WCHAR *folder, DWORD pid)
 {
@@ -114,10 +117,65 @@ static DWORD attach_input(const WCHAR *folder, DWORD pid)
     return code;
 }
 
+/* Login uses the same documented Windows service bootstrap as the runtime,
+ * without capture hooks, registry changes or account access. Recent UU builds
+ * otherwise stay on the splash screen waiting for GameViewerServer. */
+static int login_gui(const WCHAR *executable, const WCHAR *token)
+{
+    if (wcsncmp(token, L"UURB-NATIVE-", 12)) return 2;
+    HANDLE stop = CreateEventW(NULL, TRUE, FALSE, token);
+    if (!stop) return 1;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        PROCESS_INFORMATION existing = {0};
+        DWORD result = launch(executable, &existing);
+        if (existing.hThread) CloseHandle(existing.hThread);
+        if (existing.hProcess) CloseHandle(existing.hProcess);
+        CloseHandle(stop);
+        return result ? 1 : 0;
+    }
+    WCHAR path[32768];
+    DWORD length = GetModuleFileNameW(NULL, path, ARRAYSIZE(path));
+    WCHAR *base = length && length < ARRAYSIZE(path) ? wcsrchr(path, L'\\') : NULL;
+    DWORD status = ERROR_INVALID_PARAMETER;
+    PROCESS_INFORMATION winlogon = {0}, gui = {0};
+    SC_HANDLE manager = NULL, service = NULL;
+    if (!base || (size_t)(++base - path) + 32 >= ARRAYSIZE(path)) goto done;
+    wcscpy(base, L"winlogon.exe");
+    status = launch(path, &winlogon);
+    if (status) goto done;
+    manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!manager) { status = GetLastError(); goto done; }
+    service = OpenServiceW(manager, L"GameViewerService", SERVICE_START | SERVICE_USER_DEFINED_CONTROL);
+    if (!service) { status = GetLastError(); goto done; }
+    if (!StartServiceW(service, 0, NULL) && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING) {
+        status = GetLastError(); goto done;
+    }
+    SERVICE_STATUS state = {0};
+    if (!ControlService(service, 133, &state)) { status = GetLastError(); goto done; }
+    event("login_service_bootstrap_accepted", 0);
+    status = launch(executable, &gui);
+    event("login_gui_started", status);
+    if (!status) WaitForSingleObject(stop, INFINITE);
+done:
+    if (service) CloseServiceHandle(service);
+    if (manager) CloseServiceHandle(manager);
+    if (gui.hThread) CloseHandle(gui.hThread);
+    if (gui.hProcess) CloseHandle(gui.hProcess);
+    if (winlogon.hProcess) {
+        TerminateProcess(winlogon.hProcess, 0);
+        WaitForSingleObject(winlogon.hProcess, 5000);
+        CloseHandle(winlogon.hProcess); CloseHandle(winlogon.hThread);
+    }
+    CloseHandle(stop);
+    event("login_exit", status);
+    return status ? 1 : 0;
+}
+
 int wmain(int argc, WCHAR **argv)
 {
     WCHAR guard[16];
     if (GetEnvironmentVariableW(L"UURB_NATIVE_BOOTSTRAP", guard, 16) != 1 || wcscmp(guard, L"1")) return 2;
+    if (argc == 4 && !wcscmp(argv[1], L"--login")) return login_gui(argv[2], argv[3]);
     if (argc == 3 && !wcscmp(argv[1], L"--stop")) {
         if (wcsncmp(argv[2], L"UURB-NATIVE-", 12)) return 2;
         HANDLE stop = OpenEventW(EVENT_MODIFY_STATE, FALSE, argv[2]);
@@ -140,6 +198,28 @@ int wmain(int argc, WCHAR **argv)
     if (cursor_length >= 32768) return 2;
     if (cursor_length)
         settings[count++] = (struct setting){HKEY_LOCAL_MACHINE, env_key, L"UURB_CURSOR_STATE_PATH", cursor_path};
+    /* CreateEnvironmentBlock in the UU service rebuilds the Windows
+     * environment from this registry key. Carry the per-output directory too;
+     * otherwise DXGI silently opens the inactive legacy cursor.state. */
+    WCHAR cursor_directory[32768];
+    DWORD cursor_directory_length = GetEnvironmentVariableW(L"UURB_CURSOR_STATE_DIR", cursor_directory,
+                                                            ARRAYSIZE(cursor_directory));
+    if (cursor_directory_length >= ARRAYSIZE(cursor_directory)) return 2;
+    if (cursor_directory_length)
+        settings[count++] = (struct setting){HKEY_LOCAL_MACHINE, env_key, L"UURB_CURSOR_STATE_DIR", cursor_directory};
+    WCHAR cursor_presentation[16];
+    DWORD cursor_presentation_length = GetEnvironmentVariableW(L"UURB_CURSOR_PRESENTATION", cursor_presentation,
+                                                               ARRAYSIZE(cursor_presentation));
+    if (cursor_presentation_length >= ARRAYSIZE(cursor_presentation) ||
+        (cursor_presentation_length && wcscmp(cursor_presentation, L"client"))) return 2;
+    if (cursor_presentation_length)
+        settings[count++] = (struct setting){HKEY_LOCAL_MACHINE, env_key, L"UURB_CURSOR_PRESENTATION", cursor_presentation};
+    WCHAR pointer_only[8];
+    DWORD pointer_only_length = GetEnvironmentVariableW(L"UURB_DXGI_POINTER_ONLY", pointer_only, ARRAYSIZE(pointer_only));
+    if (pointer_only_length >= ARRAYSIZE(pointer_only) ||
+        (pointer_only_length && wcscmp(pointer_only, L"0") && wcscmp(pointer_only, L"1"))) return 2;
+    if (pointer_only_length)
+        settings[count++] = (struct setting){HKEY_LOCAL_MACHINE, env_key, L"UURB_DXGI_POINTER_ONLY", pointer_only};
     WCHAR display_socket[108];
     DWORD display_length = GetEnvironmentVariableW(L"UURB_DISPLAY_SOCKET", display_socket, ARRAYSIZE(display_socket));
     if (display_length >= ARRAYSIZE(display_socket) || (display_length && display_socket[0] != L'/')) return 2;
@@ -218,13 +298,35 @@ int wmain(int argc, WCHAR **argv)
     event("gui_started", status);
     if (!status && !native_input) WaitForSingleObject(stop, INFINITE);
     if (!status && native_input) {
+        /* The Super Screen UI and its RPC client live in the GUI process on
+         * some UU releases, while older releases issue the same IDD calls
+         * from GameViewerServer.exe.  Hook both, plus the Windows service
+         * when it exposes the device boundary.  A GUI/service hook failure
+         * is diagnostic-only; the server hook remains the readiness gate for
+         * the existing input path. */
+        DWORD attached_service = 0;
+        if (gui.dwProcessId) {
+            DWORD hook_status = attach_input(folder, gui.dwProcessId);
+            event("native_gui_hook_ready", hook_status);
+        }
         DWORD attached = 0;
         ULONGLONG missing_since = GetTickCount64();
+        /* UU 4.43 may replace its first server during a warm startup. Keep
+         * the owner and winlogon stand-in alive through its bounded backoff. */
+        ULONGLONG startup_deadline = missing_since + 60000;
         while (WaitForSingleObject(stop, 250) == WAIT_TIMEOUT) {
             if (WaitForSingleObject(input.hProcess, 0) == WAIT_OBJECT_0) { status = ERROR_BROKEN_PIPE; break; }
+            DWORD service = service_pid();
+            if (service && service != attached_service) {
+                DWORD hook_status = attach_input(folder, service);
+                event("native_service_hook_ready", hook_status);
+                if (!hook_status) attached_service = service;
+            }
             DWORD target = server_pid();
             if (!target) {
-                if (GetTickCount64() - missing_since > 15000) { status = ERROR_PROCESS_ABORTED; break; }
+                if (GetTickCount64() >= startup_deadline && GetTickCount64() - missing_since > 15000) {
+                    status = ERROR_PROCESS_ABORTED; break;
+                }
                 continue;
             }
             missing_since = GetTickCount64();

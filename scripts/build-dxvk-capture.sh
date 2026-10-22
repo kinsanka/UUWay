@@ -30,7 +30,9 @@ if ! cmp -s "$repo_dir/src/dxvk_capture_hook.h" "$source_dir/src/dxgi/dxgi_uurb_
 fi
 export PATH="$repo_dir/scripts:$repo_dir/build/dxvk-capture/toolchain/usr/bin:$PATH"
 if [[ ! -f "$build_dir/build.ninja" ]]; then
-    meson setup "$build_dir" "$source_dir" --cross-file "$repo_dir/config/dxvk-capture-win64.ini" \
+    cross_file="$repo_dir/config/dxvk-capture-win64.ini"
+    [[ ! -f /etc/fedora-release ]] || cross_file="$repo_dir/config/dxvk-capture-fedora.ini"
+    meson setup "$build_dir" "$source_dir" --cross-file "$cross_file" \
         --buildtype=release -Denable_d3d8=false -Denable_d3d9=false -Denable_d3d10=false \
         -Denable_d3d11=true -Denable_dxgi=true -Ddxbc-spirv:enable_tests=false -Ddxbc-spirv:enable_tools=false
 fi

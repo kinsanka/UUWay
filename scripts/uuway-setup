@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Interactive first-run setup; no account data or screen grant is preinstalled.
+set -Eeuo pipefail
+[[ $EUID -ne 0 ]] || { echo '请以桌面用户运行 UUWay 安装向导。'; exit 1; }
+installer=()
+prefix="${XDG_DATA_HOME:-$HOME/.local/share}/wineprefixes/uu-remote"
+if [[ ! -f "$prefix/drive_c/Program Files/Netease/GameViewer/bin/GameViewerServer.exe" ]]; then
+    echo '请选择从 https://uuyc.163.com/ 下载的 UU 远程 Windows 官方安装包。'
+    chosen="$(zenity --file-selection --title='选择 UU 远程官方 Windows 安装包' \
+        --filename="$HOME/Downloads/" --file-filter='Windows 安装包 | *.exe')" || exit 0
+    [[ -f "$chosen" ]] || exit 1
+    installer=(--installer "$chosen")
+fi
+exec /usr/bin/uuway setup --yes --only wine,udev,prefix,helpers,fcitx,portal,runtime,start,consent,launchers "${installer[@]}"

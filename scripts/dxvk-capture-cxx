@@ -2,6 +2,9 @@
 set -Eeuo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 compiler_root="$repo_dir/build/dxvk-capture/toolchain/usr"
+if [[ -f /etc/fedora-release ]]; then
+    exec x86_64-w64-mingw32-g++ "$@"
+fi
 exec "$compiler_root/bin/x86_64-w64-mingw32-g++-posix" \
     -B "$compiler_root/lib/gcc/x86_64-w64-mingw32/13-posix/" \
     -B /usr/lib/gcc/x86_64-w64-mingw32/13-posix/ \

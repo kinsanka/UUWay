@@ -6,3 +6,7 @@
 *.so
 __pycache__/
 .pytest_cache/
+/capture/*.so
+/release-dist/
+/private/
+portal-restore*.json
