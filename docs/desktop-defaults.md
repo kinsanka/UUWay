@@ -10,6 +10,7 @@
 2. 在新图形会话中启动 Noctalia，立即请求密码锁屏，关闭免密宽限时间及空密码解锁。确认锁屏生效后才允许 UUWay 启动。若新会话的锁屏在限定时间内无法确认，则退出该会话返回登录页。
 3. 锁屏使用系统密码验证。GNOME Keyring 的 PAM 模块接收这次认证密码，尝试解锁 **Login** 钥匙环。不会把密码写进配置、脚本或命令行。
 4. 锁屏确认后，仅取消已知的 GNOME Keyring 解锁弹窗；一旦用户解锁桌面就停止处理，不关闭其他窗口，不禁用或杀死钥匙环服务。
+5. 密码解锁后，Noctalia 的 `session_unlocked` 事件会启动一个最长 10 秒的临时检查：只有桌面已解锁、Secret Service 确认 **Login** 钥匙环 `Locked=false` 时，才关闭仍停在“等待输入密码”的登录钥匙环弹窗。再次锁屏、钥匙环仍锁定或状态查询失败时不会关闭该提示；不读取密钥内容、不提交密码，不增加常驻服务。
 
 **真正的登录界面尚未进入用户桌面，不能靠提前运行 UUWay 来采集和控制。**这里看到的是自动登录后的锁屏。远程连接依然需要通过锁屏认证后才能操作桌面。自动登录到锁屏生效之间存在短暂的会话启动阶段，这种方案不能等同于“从未登录”，也不能替代磁盘加密或限制物理访问。
 
@@ -27,6 +28,19 @@
 python3 /usr/lib/uuway/scripts/uuway_desktop.py install --dry-run
 python3 /usr/lib/uuway/scripts/uuway_desktop.py install
 ```
+
+### 已安装 0.18.1：补上解锁后的弹窗清理
+
+`fedora-0.18.1` RPM 本身只有锁屏期间的清理，尚不包含上述第 5 项。当前 `main` 的 `bash install.sh` 会在安装稳定 RPM 后自动更新这两个桌面辅助脚本，再进入原安装向导。仅补上桌面配置、不重新运行 UU 向导时，可在本项目 `main` 源码目录运行：
+
+```sh
+bash scripts/install-desktop-profile.sh
+python3 /usr/lib/uuway/scripts/uuway_desktop.py install
+```
+
+配置会保留其他解锁钩子。对于已知的 `~/.local/bin/close-keyring-popup.sh` 旧脚本，仅在内容校验完全匹配时替换其钩子；旧文件保留，原 Noctalia 配置另有备份。用户改写过的脚本不会被自动移除。
+
+本机已核对：锁屏 PAM 包含 `pam_gnome_keyring.so auto_start`，密码解锁后的 Login 钥匙环确实处于解锁状态，用户原先也已设置 `session_unlocked` 关闭残留弹窗。此处将这项做法纳入默认配置，并收窄为只处理已解锁的 Login 钥匙环提示；安装过程不触发锁屏，不中断 UU 或通话。下一次自然锁屏/解锁时才会走新的事件钩子。
 
 ## GNOME Keyring 必须安装
 
@@ -76,3 +90,5 @@ background_render = true
 修改前备份到 `~/backup/UUWay/桌面默认配置/backup-*/`。`files.json` 记录原路径及原文件是否存在，按原路径保存用户配置和可读的系统配置。备份含个人设置，不公开上传。
 
 回退前先用 VNC／本机终端，停止并停用 `uuway-session-guard.service`，移除新建的 `90-login-lock.conf`，按备份恢复用户文件并重新加载用户服务。`/etc/pam.d/login` 和 `/etc/greetd/config.toml` 要使用 sudo 及 root 所有权恢复；不要把整个备份目录以 root 身份递归复制进用户目录。若自动登录原本就是用户设置的，保留该设置并自行决定是否关闭。整个安装过程不会重启 greetd、Umbriel、音频服务或通话程序。
+
+仅撤回本次辅助脚本更新时，可从 `helpers-*/` 将两个 Python 文件用 `sudo install -o root -g root -m 0644` 恢复到 `/usr/lib/uuway/scripts/`，同时从对应 `backup-*/` 恢复原 Noctalia 设置；无需结束图形会话。

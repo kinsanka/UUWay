@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SYSTEM = ROOT / 'scripts/uuway_desktop_system.py'
 PAM = Path('/etc/pam.d/login')
 GREETD = Path('/etc/greetd/config.toml')
+LOGIN_PROMPT_TITLES = ('Unlock Login Keyring', '解锁登录密钥环', '解锁“登录”密钥环')
+LEGACY_PROMPT_SHA256 = '0d1da89f654169ebac093c665eeec16237aef0e99cdb4ce492f8c3a0db084569'
 
 
 def run(argv, *, check=True, timeout=15):
@@ -124,13 +126,66 @@ def clear_prompts():
         windows = json.loads(run(['/usr/bin/umbriel', 'windows', '--json']).stdout)
         for window in windows:
             if (window.get('app_id') == 'gcr-prompter' and
-                    window.get('title') in ('Unlock Login Keyring', '解锁登录密钥环', '解锁“登录”密钥环') and
+                    window.get('title') in LOGIN_PROMPT_TITLES and
                     re.fullmatch(r'[A-Za-z0-9_-]{1,128}', str(window.get('id', '')))):
                 # Recheck before each close: never cancel the owner's unlocked prompt.
                 if not status():
                     return
                 run(['/usr/bin/umbriel', 'msg', 'window-close:' + str(window['id'])])
         time.sleep(.5)
+
+
+def login_keyring_unlocked():
+    """Read only the Login collection's lock bit; never unlock or read secrets."""
+    try:
+        from gi.repository import Gio, GLib
+    except ImportError:
+        return False
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        reply = bus.call_sync(
+            'org.freedesktop.secrets', '/org/freedesktop/secrets/collection/login',
+            'org.freedesktop.DBus.Properties', 'Get',
+            GLib.Variant('(ss)', ('org.freedesktop.Secret.Collection', 'Locked')),
+            GLib.VariantType.new('(v)'), Gio.DBusCallFlags.NO_AUTO_START, 2000, None)
+        value = reply.get_child_value(0).get_variant()
+        return value.is_of_type(GLib.VariantType.new('b')) and not value.get_boolean()
+    except (ValueError, GLib.Error):
+        return False
+
+
+def clear_unlocked_prompts():
+    """Close stale Login prompts after password unlock, never a locked keyring."""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if status():
+            return  # A new lock ends this unlock hook immediately.
+        if login_keyring_unlocked():
+            windows = json.loads(run(['/usr/bin/umbriel', 'windows', '--json']).stdout)
+            for window in windows:
+                if (window.get('app_id') == 'gcr-prompter' and
+                        window.get('title') in LOGIN_PROMPT_TITLES and
+                        re.fullmatch(r'[A-Za-z0-9_-]{1,128}', str(window.get('id', '')))):
+                    if status() or not login_keyring_unlocked():
+                        return
+                    run(['/usr/bin/umbriel', 'msg', 'window-close:' + str(window['id'])])
+        time.sleep(.5)
+
+
+def unlocked():
+    # Keep the Noctalia hook short; the bounded worker also covers PAM completion.
+    subprocess.Popen(['/usr/bin/python3', str(Path(__file__).resolve()), 'clear-unlocked-prompts'],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+
+
+def unlock_hooks(existing, legacy):
+    commands = [existing] if isinstance(existing, str) else list(existing)
+    hook = '/usr/bin/python3 /usr/lib/uuway/scripts/uuway_desktop.py unlocked'
+    # Migrate only the exact known, broad app-id-only workaround. Keep custom hooks.
+    known_legacy = (legacy.is_file() and not legacy.is_symlink() and
+                    hashlib.sha256(legacy.read_bytes()).hexdigest() == LEGACY_PROMPT_SHA256)
+    return [hook] + [x for x in commands if x != hook and not (known_legacy and x == str(legacy))]
 
 
 def install(*, autologin=True, dry_run=False):
@@ -162,7 +217,10 @@ def install(*, autologin=True, dry_run=False):
     commands.insert(0, hook)
     desired = set_table(original, 'lockscreen', {'enabled': True, 'grace_period_seconds': 0,
                                                 'allow_empty_password': False, 'fingerprint': False})
-    desired = set_table(desired, 'hooks', {'session_locked': commands})
+    desired = set_table(desired, 'hooks', {
+        'session_locked': commands,
+        'session_unlocked': unlock_hooks(effective.get('session_unlocked', []),
+                                         h / '.local/bin/close-keyring-popup.sh')})
     units = h / '.config/systemd/user'
     guard_unit = units / 'uuway-session-guard.service'
     bridge_drop = units / 'uu-native-bridge.service.d/90-login-lock.conf'
@@ -242,7 +300,8 @@ def hide_tray():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['install', 'guard', 'locked', 'clear-prompts', 'hide-tray'])
+    parser.add_argument('action', choices=['install', 'guard', 'locked', 'unlocked', 'clear-prompts',
+                                           'clear-unlocked-prompts', 'hide-tray'])
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--no-autologin', action='store_true')
     args = parser.parse_args()
@@ -250,7 +309,8 @@ if __name__ == '__main__':
         if args.action == 'install':
             install(autologin=not args.no_autologin, dry_run=args.dry_run)
         else:
-            {'guard': guard, 'locked': locked, 'clear-prompts': clear_prompts, 'hide-tray': hide_tray}[args.action]()
+            {'guard': guard, 'locked': locked, 'unlocked': unlocked, 'clear-prompts': clear_prompts,
+             'clear-unlocked-prompts': clear_unlocked_prompts, 'hide-tray': hide_tray}[args.action]()
     except Exception as error:
         print('UUWay desktop profile failed: ' + str(error))
         raise SystemExit(1)

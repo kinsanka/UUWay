@@ -76,6 +76,40 @@ class DesktopDefaults(unittest.TestCase):
             with patch.object(desktop,'session_marker',return_value=marker),patch.object(desktop,'run') as action:
                 desktop.guard();action.assert_not_called()
 
+    def test_unlock_cleanup_waits_for_keyring_and_preserves_unrelated_prompts(self):
+        windows = [dict(id='login', app_id='gcr-prompter', title='Unlock Login Keyring'),
+                   dict(id='other', app_id='gcr-prompter', title='Unlock Personal Keyring'),
+                   dict(id='editor', app_id='editor', title='Unlock Login Keyring')]
+        with patch.object(desktop, 'status', return_value=False), \
+                patch.object(desktop, 'login_keyring_unlocked', side_effect=[False, True, True]), \
+                patch.object(desktop.time, 'monotonic', side_effect=[0, 0, 1, 11]), \
+                patch.object(desktop.time, 'sleep'), \
+                patch.object(desktop, 'run', return_value=subprocess.CompletedProcess([], 0, stdout=json.dumps(windows))) as action:
+            desktop.clear_unlocked_prompts()
+            self.assertEqual([c.args[0] for c in action.call_args_list], [
+                ['/usr/bin/umbriel', 'windows', '--json'],
+                ['/usr/bin/umbriel', 'msg', 'window-close:login']])
+
+    def test_unlock_cleanup_stops_on_relock_or_keyring_lock(self):
+        window = [dict(id='login', app_id='gcr-prompter', title='Unlock Login Keyring')]
+        for statuses, keyrings in [([True], []), ([False, True], [True]), ([False, False], [True, False])]:
+            with patch.object(desktop, 'status', side_effect=statuses), \
+                    patch.object(desktop, 'login_keyring_unlocked', side_effect=keyrings), \
+                    patch.object(desktop, 'run', return_value=subprocess.CompletedProcess([], 0, stdout=json.dumps(window))) as action:
+                desktop.clear_unlocked_prompts()
+                self.assertFalse(any('window-close:' in str(c) for c in action.call_args_list))
+
+    def test_unlock_hooks_are_idempotent_and_keep_custom_commands(self):
+        with tempfile.TemporaryDirectory() as d:
+            legacy = Path(d) / 'close-keyring-popup.sh'
+            legacy.write_text('custom command\n')
+            commands = [str(legacy), 'owner-unlock-command']
+            new = desktop.unlock_hooks(commands, legacy)
+            self.assertEqual(new[1:], commands)
+            self.assertEqual(desktop.unlock_hooks(new, legacy), new)
+            with patch.object(desktop, 'LEGACY_PROMPT_SHA256', desktop.hashlib.sha256(legacy.read_bytes()).hexdigest()):
+                self.assertEqual(desktop.unlock_hooks(commands, legacy)[1:], ['owner-unlock-command'])
+
     def test_guard_requires_confirmed_lock_before_recording_ready(self):
         with tempfile.TemporaryDirectory() as d:
             marker=Path(d)/'marker'

@@ -25,4 +25,6 @@ expected="$(awk -v name="$rpm_name" '$2 == name {print $1}' "$cache/SHA256SUMS")
 actual="$(sha256sum "$cache/$rpm_name")"
 [[ ${actual%% *} == "$expected" ]] || { echo 'RPM 校验失败，请重试下载。' >&2; exit 1; }
 sudo dnf install "$cache/$rpm_name"
+# Main may contain a desktop-only fix newer than the stable runtime RPM.
+bash "$(dirname -- "${BASH_SOURCE[0]}")/install-desktop-profile.sh"
 exec /usr/lib/uuway/scripts/uuway-setup
