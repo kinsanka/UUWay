@@ -10,8 +10,20 @@ import importlib.util
 import json
 from pathlib import Path
 import threading
+import traceback
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def report_failure(event, error, *, worker=None):
+    """Keep crash locations useful without logging exception text or payloads."""
+    detail = dict(event=event, error_type=type(error).__name__, frames=[
+        dict(file=Path(frame.filename).name, line=frame.lineno, function=frame.name)
+        for frame in traceback.extract_tb(error.__traceback__)
+    ])
+    if worker is not None:
+        detail['worker'] = worker
+    print(json.dumps(detail), flush=True)
 
 
 def load(name):
@@ -35,6 +47,7 @@ class Worker:
                 raise RuntimeError('Background worker exited unexpectedly')
         except Exception as error:
             self.failure = type(error).__name__
+            report_failure('background_worker_failed', error, worker=self.name)
             self.stop.set()
             self.ready.set()  # Wake startup; failure is checked before continuing.
 
@@ -95,5 +108,5 @@ if __name__ == '__main__':
         run(args.config)
     except Exception as error:
         # Never include clipboard text, account data or private argv in the journal.
-        print(json.dumps(dict(event='uuway_failed', error_type=type(error).__name__)), flush=True)
+        report_failure('uuway_failed', error)
         raise SystemExit(1)

@@ -1,5 +1,8 @@
 """Unified worker lifecycle; no real Wine, compositor or audio device is used."""
 import importlib.util
+import contextlib
+import io
+import json
 from pathlib import Path
 import threading
 import unittest
@@ -34,6 +37,25 @@ class UnifiedWorkers(unittest.TestCase):
         worker.thread.join(timeout=1)
         self.assertTrue(stop.is_set())
         self.assertEqual(worker.failure, 'ValueError')
+
+    def test_failure_reports_origin_without_private_exception_or_source_text(self):
+        stop = threading.Event()
+        def fail(s, ready):
+            raise ValueError('private clipboard text and account token')
+        worker = daemon.Worker('clipboard', fail, stop)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            with self.assertRaises(RuntimeError):
+                worker.start(timeout=1)
+            worker.thread.join(timeout=1)
+        event = json.loads(output.getvalue())
+        self.assertEqual(event['worker'], 'clipboard')
+        self.assertEqual(event['error_type'], 'ValueError')
+        self.assertEqual(event['frames'][-1]['function'], 'fail')
+        self.assertEqual(event['frames'][-1]['file'], Path(__file__).name)
+        self.assertNotIn('private clipboard', output.getvalue())
+        self.assertNotIn(str(ROOT), output.getvalue())
+        self.assertTrue(stop.is_set())
 
     def test_unexpected_exit_stops_group(self):
         stop = threading.Event()
