@@ -227,9 +227,10 @@ class RuntimeStepTests(CliCase):
 
     def test_bridge_is_stopped_before_files_change_and_units_reload_after(self):
         self.run_runtime(bridge_active=True)
-        kinds = [next((tag for tag in ("stop", "install-uu", "configure-uu", "daemon-reload") if tag in " ".join(c)),
-                      None) for c in self.commands]
-        self.assertEqual([k for k in kinds if k], ["stop", "install-uu", "configure-uu", "daemon-reload"])
+        kinds = ['preflight' if '--check' in c else next(
+            (tag for tag in ("stop", "install-uu", "configure-uu", "daemon-reload") if tag in " ".join(c)),
+            None) for c in self.commands]
+        self.assertEqual([k for k in kinds if k], ["preflight", "stop", "install-uu", "configure-uu", "daemon-reload"])
 
     def stage_existing_install(self):
         """A working install as install.sh leaves it: units, config, helpers, proxies, menu entry."""
@@ -1776,6 +1777,20 @@ class UmbrielIntegrationTests(CliCase):
             self.quiet(cli.runtime_run, ctx)
         self.assertEqual(json.loads((ctx.config_dir / 'video-codec.json').read_text()),
                          {'schema': 1, 'codec': 'auto'})
+
+    def test_rejected_upgrade_preflight_leaves_live_service_running(self):
+        ctx = self.record_commands(self.context())
+        original = ctx.run
+        def reject(argv, **kwargs):
+            if '--check' in [str(x) for x in argv]:
+                raise cli.SetupError('unrecognized service fixture')
+            return original(argv, **kwargs)
+        ctx.run = reject
+        with patch.object(cli, 'package_bundle', return_value=self.home / 'new-bundle'), \
+                patch.object(cli, 'unit_active', return_value=True):
+            with self.assertRaises(cli.SetupError):
+                self.quiet(cli.runtime_run, ctx)
+        self.assertFalse(any('stop' in c or 'disable' in c for c in self.commands))
 
     def test_only_the_unified_service_starts(self):
         ctx = self.record_commands(self.context())

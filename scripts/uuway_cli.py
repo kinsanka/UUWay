@@ -847,6 +847,14 @@ def runtime_run(ctx):
     if not getattr(ctx, 'backend', None):
         ctx.backend = backend_for_context(ctx)
     bundle = package_bundle(ctx)
+    command = [PYTHON, ROOT / 'scripts/install-uu-native-service.py', '--bundle', bundle,
+               '--prefix', ctx.prefix, '--restore-state', ctx.restore_state,
+               '--state-parent', ctx.state_dir, '--text-socket', ctx.state_dir / 'text.sock',
+               '--backend', ctx.backend]
+    if not ctx.runtime_config.exists():
+        command += ['--cursor-mode', 'embedded' if platform.niri() else 'metadata', '--preserve-display-session']
+    # Reject unknown managed commands before interrupting a healthy connection.
+    ctx.run(command + ['--check'])
     new_manifest = read_json(bundle / 'manifest.json') or {}
     if (new_manifest.get('contract', {}).get('virtual_display_emulation') is True and
             str(bundle) != previous.get('bundle')):
@@ -870,13 +878,6 @@ def runtime_run(ctx):
             if not ctx.dry_run:
                 old_override.unlink()  # Saved by ensure_backup before any change.
     ok(f'运行时：{bundle}')
-    command = [PYTHON, ROOT / 'scripts/install-uu-native-service.py', '--bundle', bundle,
-               '--prefix', ctx.prefix, '--restore-state', ctx.restore_state,
-               '--state-parent', ctx.state_dir, '--text-socket', ctx.state_dir / 'text.sock',
-               '--backend', ctx.backend]
-    if not ctx.runtime_config.exists():
-        # A re-run must keep what the console saved, so these only go in on a fresh install.
-        command += ['--cursor-mode', 'embedded' if platform.niri() else 'metadata', '--preserve-display-session']
     ctx.run(command)
     if platform.umbriel():
         codec_policy = ctx.config_dir / 'video-codec.json'

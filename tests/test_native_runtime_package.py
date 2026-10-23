@@ -577,6 +577,18 @@ class PackageIsolationTests(unittest.TestCase):
             self.assertNotIn('Wants=uu-native-display',content)
             self.assertNotIn('Wants=uu-native-text',content)
             self.assertNotIn('--allow-display-reconfigure',content)
+            before = (units/'uu-native-bridge.service').read_bytes()
+            config = root/'.config/uurb/native-runtime.json'
+            config_before = config.read_bytes()
+            with patch.object(installer.Path,'home',return_value=root), \
+                    patch.dict(os.environ,{'XDG_CURRENT_DESKTOP':'umbriel'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                installer.install(bundle,prefix,state/'portal.json',state,state/'text.sock',check_only=True)
+                self.assertEqual(before,(units/'uu-native-bridge.service').read_bytes())
+                self.assertEqual(config_before,config.read_bytes())
+                installer.install(bundle,prefix,state/'portal.json',state,state/'text.sock')
+            self.assertEqual(before,(units/'uu-native-bridge.service').read_bytes())
+            self.assertEqual(json.loads(config.read_text())['cursor_mode'],'metadata')
 
     def test_managed_display_policy_does_not_guess_from_comments_or_unknown_options(self):
         spec = importlib.util.spec_from_file_location('policy_installer', ROOT/'scripts/install-uu-native-service.py')
@@ -588,6 +600,10 @@ class PackageIsolationTests(unittest.TestCase):
                      '[Unit]\n'+command, '[Service]\n'+command+'\\\n --preserve-display-session'):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 installer.existing_display_policy(text)
+        unified = command.replace('uu-native-service.py', 'uuway_daemon.py')
+        self.assertFalse(installer.existing_display_policy('[Service]\n'+unified))
+        with self.assertRaises(ValueError):
+            installer.existing_display_policy('[Service]\n'+unified+' --unknown')
 
 
     def test_build_changes_cannot_replace_released_producer(self):

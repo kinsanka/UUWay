@@ -38,6 +38,10 @@ def existing_display_policy(content):
     if len(commands) != 1:
         raise ValueError('Unrecognized managed main service command')
     command = commands[0]
+    if (len(command) == 4 and command[0] == '/usr/bin/python3' and
+            command[1].endswith('/scripts/uuway_daemon.py') and
+            command[2:] == ['--config', '%h/.config/uurb/native-runtime.json']):
+        return False  # Unified Umbriel has no display-reconfiguration policy.
     if (len(command) not in (4, 5, 6) or command[0] != '/usr/bin/python3' or
             not command[1].endswith('/scripts/uu-native-service.py') or
             command[2:4] != ['--config', '%h/.config/uurb/native-runtime.json'] or
@@ -49,7 +53,7 @@ def existing_display_policy(content):
 
 
 def install(bundle, prefix, restore_state, state_parent, text_socket, cursor_mode=None,
-            preserve_display_session=None, backend=None):
+            preserve_display_session=None, backend=None, *, check_only=False):
     verified = trial.bundle_tools.verify(bundle)
     if not verified.get('native_service_lifetime_included'):
         raise ValueError('Expected a continuous-lifetime capable native bundle')
@@ -114,6 +118,9 @@ def install(bundle, prefix, restore_state, state_parent, text_socket, cursor_mod
     roots = {unit: str(service_root(unit.name, bundle, verified)) for unit in units}
     if any(any(c in root for c in ('\n', '\r', '"', '\\')) for root in roots.values()):
         raise ValueError('Unsupported service installation path')
+    if check_only:
+        print(json.dumps(dict(event='native_service_preflight_ok', active_service_changed=False)))
+        return
     trial.state_tools.write_private(config_path, config)
     for unit in units:
         content = (ROOT / 'systemd' / (unit.name + '.in')).read_text().replace('@ROOT@', roots[unit].replace('%', '%%'))
@@ -155,6 +162,7 @@ if __name__ == '__main__':
                         help='Keep the installed main-unit policy when omitted; explicit enable requires geometry support')
     parser.add_argument('--backend', choices=('nvidia', 'amd'),
                         help='Persist the selected GPU backend in the user runtime config')
+    parser.add_argument('--check', action='store_true', help='Validate before stopping the live service; do not stage configuration')
     args = parser.parse_args()
     install(args.bundle, args.prefix, args.restore_state, args.state_parent, args.text_socket, args.cursor_mode,
-            args.preserve_display_session, args.backend)
+            args.preserve_display_session, args.backend, check_only=args.check)
