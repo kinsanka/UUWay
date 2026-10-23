@@ -12,7 +12,7 @@
 
 适用范围：**Fedora 44 x86_64、Umbriel、Wine 11.0、可用的 Intel VA-API 驱动**。实测 Intel UHD 730、1080p / 60 Hz、Noctalia 5.3.0；默认登录配置还需要已有的 greetd。其他显卡和桌面请先阅读验证边界。
 
-1. 从 [Fedora 发布页](https://github.com/kinsanka/UUWay/releases/tag/fedora-0.18.1) 下载 RPM，打开终端安装：
+1. 从 [Fedora 发布页](https://github.com/kinsanka/UUWay_Fedora-Umbriel/releases/tag/fedora-0.18.1) 下载 RPM，打开终端安装：
 
    ```sh
    sudo dnf install ./uuway-0.18.1-1.fedora_umbriel.fc44.x86_64.rpm

@@ -10,7 +10,7 @@ desktop=${XDG_CURRENT_DESKTOP:-}
 }
 tag=fedora-0.18.1
 rpm_name=uuway-0.18.1-1.fedora_umbriel.fc44.x86_64.rpm
-base="https://github.com/kinsanka/UUWay/releases/download/$tag"
+base="https://github.com/kinsanka/UUWay_Fedora-Umbriel/releases/download/$tag"
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/uuway-installer/$tag"
 mkdir -p "$cache"
 [[ ! -L "$cache" && $(stat -c %u "$cache") == "$UID" ]] || exit 1
