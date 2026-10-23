@@ -17,6 +17,26 @@ import time
 LIMIT = 4 * 1024 * 1024
 STOP = False
 
+
+class TransferGuard:
+    """Back off a conflicting clipboard writer without ending the video service."""
+    def __init__(self):
+        self.changes = deque()
+        self.paused_until = 0
+
+    def allow(self, now):
+        if now < self.paused_until:
+            return False
+        while self.changes and self.changes[0] < now - 10:
+            self.changes.popleft()
+        if len(self.changes) >= 12:
+            self.changes.clear()
+            self.paused_until = now + 10
+            print('UU clipboard transfer burst: pausing sync for 10 seconds; no payload logged', flush=True)
+            return False
+        self.changes.append(now)
+        return True
+
 def bounded(command, data=None, timeout=2):
     if data is not None:
         # wl-copy forks a selection owner that inherits stdout. Capturing that
@@ -106,7 +126,10 @@ def synchronize(wine, previous, changed, remote, current):
     if changed and remote is not None and remote != current:
         result=bounded(['/usr/bin/wl-copy','--type','text/plain;charset=utf-8'],remote)
         if result is not None: return remote
-    return current
+    # A failed read or an unsupported selection is not a new text selection.
+    # Retaining the last observation prevents a later successful read of the
+    # same text from being echoed into Wine again.
+    return previous if current is None else current
 
 def main(*, stop_event=None, ready_event=None, prefix=None, helper=None):
     helper=helper or Path(__file__).with_name('uu-clipboard-pipe.exe')
@@ -116,19 +139,18 @@ def main(*, stop_event=None, ready_event=None, prefix=None, helper=None):
         print('UU bidirectional text clipboard ready',flush=True)
         if ready_event is not None:
             ready_event.set()
-        changes=deque()
+        transfers=TransferGuard()
         while not STOP and not (stop_event is not None and stop_event.is_set()):
             changed, remote=wine.get()
             current=native()
             would_transfer=((current!=previous and current is not None and current!=remote)
                             or (changed and remote is not None and remote!=current))
-            if would_transfer:
-                now=time.monotonic()
-                while changes and changes[0]<now-10:changes.popleft()
-                if len(changes)>=12:
-                    raise RuntimeError('Clipboard transfer circuit breaker; no payload logged')
-                changes.append(now)
-            previous=synchronize(wine,previous,changed,remote,current)
+            if would_transfer and not transfers.allow(time.monotonic()):
+                # Consume both observations during backoff, but write neither
+                # selection. A later copy can sync after the cooldown.
+                previous = previous if current is None else current
+            else:
+                previous=synchronize(wine,previous,changed,remote,current)
             if stop_event is None:
                 time.sleep(.3)
             else:

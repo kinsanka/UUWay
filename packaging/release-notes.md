@@ -6,5 +6,6 @@
 - Hide only the UU Wine prefix's `explorer.exe` / `Shell_TrayWnd` host through the existing clipboard helper. Do not close the host or end UU's background lifecycle. A one-shot hide command and rollback instructions are documented in [Desktop defaults](../docs/desktop-defaults.md).
 - Record the failing background worker and source location without exception text, clipboard contents, account data or full filesystem paths.
 - Accept the existing unified service during upgrades and validate its configuration before stopping a live UU connection.
+- Back off conflicting clipboard transfers for 10 seconds instead of terminating the whole remote session; retain the last native text observation across unavailable selections to avoid redundant writes.
 
 The previous 0.18.0 runtime passed the user's remote picture/input/text-clipboard and reconnect checks. First-login locking, keyring unlock and the new tray-hiding behavior require separate desktop acceptance. Simultaneous hypervisor VNC and UU use remains under investigation; this release does not claim to fix it. Audio forwarding remains unresolved. Sunshine and existing audio routes are preserved.

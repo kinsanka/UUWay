@@ -8,6 +8,8 @@
 
 一个 `uuway.service` 别名指向 `uu-native-bridge.service`。`uuway_daemon.py` 校验不可变运行时包，先启动只读显示 RPC 线程，在 UU 引导就绪后启动文本剪贴板线程。任一管理线程意外退出会停止整组，由 systemd 统一恢复。线程不会互相发送 systemd READY/WATCHDOG。
 
+剪贴板在 10 秒内反复传输超过保护阈值时，仅暂停同步 10 秒，再允许后续复制；不因此结束远程画面和键鼠连接。暂时无法读取原生文本时保留上次观察值，减少重复写入。此保护不代表已确定其他远程软件是反复同步的来源。
+
 显示与剪贴板不再各运行一个持久 Python 管理进程。Wine、Windows UU 服务、原生输入、采集与终端工作进程仍然存在。采集及编码的数据通路保持不变。
 
 显示适配读取 Umbriel IPC，只报告现有活动模式。屏幕通过 xdg-desktop-portal / PipeWire 获取。`uu-umbriel-cursor-meta.so` 处理本环境的光标元数据协商，保留独立光标。Intel 的局部 `INTEL_DEBUG=noccs,nofc` 修正限定于 UUWay 子进程。
@@ -48,7 +50,7 @@ python3 packaging/build-rpm.py --version 0.18.1 --release 1.fedora_umbriel
 
 ```sh
 set -e
-for suite in test_desktop_defaults test_unified_supervisor test_native_service test_fedora_port \
+for suite in test_desktop_defaults test_unified_supervisor test_wayland_clipboard test_native_service test_fedora_port \
   test_native_runtime_package test_uuway_cli test_wayland_portal_probe; do
   python3 -m unittest discover -s tests -p "$suite.py"
 done
